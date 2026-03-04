@@ -50,6 +50,7 @@ except ImportError:
 
 from rna_structure_plucker import (
     preprocess_sample, collate_rna, compute_bpp, N_EDGE_FEATS, PAD_ID,
+    compute_ss_mfe, encode_ss,
 )
 
 
@@ -138,6 +139,30 @@ class BPPCache:
         np.save(path, bpp)
         return bpp
 
+    def _ssmfe_path(self, seq: str) -> str:
+        key = hashlib.md5(seq.upper().encode()).hexdigest()
+        return os.path.join(self.cache_dir, f'{key}_ssmfe.npz')
+
+    def get_ss_mfe(self, seq: str) -> Tuple[np.ndarray, float]:
+        """
+        Return (ss_ids, mfe) for *seq* with disk caching.
+
+        ss_ids is an int8 array of length L (class IDs: 0=., 1=(, 2=)).
+        mfe is the MFE in kcal/mol from RNA.fold().
+
+        Always uses RNA.fold() regardless of the BPP backend, because SS/MFE
+        are independent of the partition-function BPP computation.
+        Falls back to all-unpaired / 0.0 if ViennaRNA is not installed.
+        """
+        path = self._ssmfe_path(seq)
+        if os.path.exists(path):
+            data = np.load(path)
+            return data['ss_ids'], float(data['mfe'])
+        ss_str, mfe = compute_ss_mfe(seq)
+        ss_ids = encode_ss(ss_str)
+        np.savez(path, ss_ids=ss_ids, mfe=np.float32(mfe))
+        return ss_ids, float(mfe)
+
     def warm_up(self, sequences: List[str], verbose: bool = True) -> None:
         """Pre-populate cache for a list of sequences (single-threaded)."""
         n = len(sequences)
@@ -173,6 +198,7 @@ class BaseUTRDataset(Dataset):
         bpp_cache:     Optional[BPPCache] = None,
         max_len:       Optional[int] = None,
         lazy:          bool = False,
+        aux_struct:    bool = False,   # include SS class IDs and MFE in samples
     ):
         self.local_offsets = local_offsets
         self.top_k_struct  = top_k_struct
@@ -180,6 +206,7 @@ class BaseUTRDataset(Dataset):
         self.bpp_cache     = bpp_cache
         self.max_len       = max_len
         self.lazy          = lazy
+        self.aux_struct    = aux_struct
 
         self.sequences:    List[str]           = []
         self.labels:       List[float]         = []
@@ -192,6 +219,13 @@ class BaseUTRDataset(Dataset):
         if self.bpp_cache is not None:
             return self.bpp_cache.get(seq)
         return compute_bpp(seq)
+
+    def _get_ss_mfe(self, seq: str) -> Tuple[np.ndarray, float]:
+        """Return (ss_ids int8 array, mfe float) for seq."""
+        if self.bpp_cache is not None:
+            return self.bpp_cache.get_ss_mfe(seq)
+        ss_str, mfe = compute_ss_mfe(seq)
+        return encode_ss(ss_str), mfe
 
     def _truncate(self, seq: str) -> str:
         return seq[:self.max_len] if self.max_len is not None else seq
@@ -206,6 +240,10 @@ class BaseUTRDataset(Dataset):
         sample['label'] = float(self.labels[idx])
         if self.library_ids is not None:
             sample['library_id'] = int(self.library_ids[idx])
+        if self.aux_struct:
+            ss_ids, mfe = self._get_ss_mfe(seq)
+            sample['ss_ids'] = ss_ids
+            sample['mfe']    = np.float32(mfe)
         return sample
 
     def _build_samples(self) -> None:

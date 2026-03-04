@@ -20,6 +20,10 @@ Usage examples:
 
   # Quick sanity check with structure disabled (local edges only):
   python train_utr.py --task mrl --data eGFP_U1.csv --bpp_backend zero
+
+  # UTR-LM comparison: add SS + MFE auxiliary supervision heads:
+  python train_utr.py --task mrl --data eGFP_U1.csv --aux_struct
+  python train_utr.py --task mrl --data eGFP_U1.csv --aux_struct --lambda_ss 0.2 --lambda_mfe 0.05
 """
 
 import argparse
@@ -27,8 +31,8 @@ import dataclasses
 import os
 import time
 import warnings
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 # LambdaLR calls step() in __init__ before any optimizer step, which triggers
 # a spurious PyTorch warning.  Suppress it — the training loop order is correct.
@@ -72,6 +76,14 @@ class TrainConfig:
     ff_dim:       Optional[int] = None # default: 4*model_dim
     dropout:      float = 0.1
     pooling:      str   = 'attention'
+
+    # Auxiliary structure supervision (UTR-LM comparison mode)
+    # When enabled, the model also predicts secondary structure (per-token)
+    # and MFE (sequence-level) as auxiliary targets computed by ViennaRNA,
+    # exactly mirroring what UTR-LM does during pretraining.
+    aux_struct:   bool  = False        # add SS + MFE auxiliary prediction heads
+    lambda_ss:    float = 0.1          # weight for per-token SS cross-entropy
+    lambda_mfe:   float = 0.01         # weight for scalar MFE regression
 
     # Training
     epochs:       int   = 60
@@ -128,8 +140,9 @@ def build_dataset(cfg: TrainConfig):
     cache = BPPCache(cfg.bpp_cache_dir, backend=cfg.bpp_backend)
     common = dict(
         bpp_cache=cache,
-        top_k_struct=4,
+        top_k_struct=0 if cfg.bpp_backend == 'zero' else 4,
         bp_threshold=0.05,
+        aux_struct=cfg.aux_struct,
     )
 
     if cfg.task == 'mrl':
@@ -185,6 +198,9 @@ def build_model(cfg: TrainConfig) -> RNAStructureGrassmann:
         pooling      = cfg.pooling,
         task         = task_type,
         num_libraries= num_libraries,
+        aux_struct   = cfg.aux_struct,
+        lambda_ss    = cfg.lambda_ss,
+        lambda_mfe   = cfg.lambda_mfe,
     )
 
 
@@ -216,13 +232,21 @@ def train_epoch(
     total_loss = 0.0
     use_amp    = scaler is not None
     for batch in loader:
-        batch   = {k: v.to(device) for k, v in batch.items()}
-        labels  = batch.pop('labels', None)
-        lib_ids = batch.pop('library_ids', None)
+        batch      = {k: v.to(device) for k, v in batch.items()}
+        labels     = batch.pop('labels', None)
+        lib_ids    = batch.pop('library_ids', None)
+        ss_labels  = batch.pop('ss_ids', None)   # present only when aux_struct=True
+        mfe_labels = batch.pop('mfe', None)       # present only when aux_struct=True
 
         optimiser.zero_grad()
         with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-            _, loss = model(**batch, labels=labels, library_ids=lib_ids)
+            _, loss = model(
+                **batch,
+                labels=labels,
+                library_ids=lib_ids,
+                ss_labels=ss_labels,
+                mfe_labels=mfe_labels,
+            )
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -256,6 +280,10 @@ def evaluate(
         batch   = {k: v.to(device) for k, v in batch.items()}
         labels  = batch.pop('labels', None)
         lib_ids = batch.pop('library_ids', None)
+        # Pop aux labels so they don't reach forward() — evaluation uses
+        # primary-task logits only; auxiliary losses are not computed here.
+        batch.pop('ss_ids', None)
+        batch.pop('mfe', None)
         logits, _ = model(**batch, library_ids=lib_ids)
         all_preds.append(logits.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
@@ -350,8 +378,9 @@ def train_fold(
 
     val_size = len(val_dataset) if val_dataset is not None else len(val_idx)
     amp_tag  = 'AMP' if scaler else 'fp32'
+    aux_tag  = f' | aux_struct λ_ss={cfg.lambda_ss} λ_mfe={cfg.lambda_mfe}' if cfg.aux_struct else ''
     print(f'\n  Fold {fold_num} | {len(train_idx)} train / {val_size} val '
-          f'| {n_params:,} params | {amp_tag} | eval_every={cfg.eval_every}')
+          f'| {n_params:,} params | {amp_tag} | eval_every={cfg.eval_every}{aux_tag}')
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         t0         = time.time()
@@ -452,6 +481,8 @@ def run_cv(cfg: TrainConfig):
     print(f'Task: {cfg.task} | Data: {cfg.data} | Device: {cfg.device}')
     print(f'Model: dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
     print(f'BPP backend: {cfg.bpp_backend} | Folds: {cfg.folds}')
+    if cfg.aux_struct:
+        print(f'Aux struct: ON  (λ_ss={cfg.lambda_ss}, λ_mfe={cfg.lambda_mfe})')
 
     dataset = build_dataset(cfg)
     n       = len(dataset)
@@ -539,6 +570,15 @@ def parse_args() -> TrainConfig:
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--pooling',      default='attention',
                    choices=['attention', 'mean'])
+    # Auxiliary structure supervision
+    p.add_argument('--aux_struct',   action='store_true',
+                   help='Add SS (per-token) and MFE (scalar) auxiliary prediction '
+                        'heads, trained alongside the primary task.  Mirrors the '
+                        'auxiliary supervision strategy used in UTR-LM.')
+    p.add_argument('--lambda_ss',    type=float, default=0.1,
+                   help='Loss weight for the auxiliary SS cross-entropy term')
+    p.add_argument('--lambda_mfe',   type=float, default=0.01,
+                   help='Loss weight for the auxiliary MFE MSE term')
     # Training
     p.add_argument('--epochs',       type=int,   default=60)
     p.add_argument('--batch_size',   type=int,   default=64)
@@ -582,6 +622,9 @@ def parse_args() -> TrainConfig:
         reduced_dim  = args.reduced_dim,
         dropout      = args.dropout,
         pooling      = args.pooling,
+        aux_struct   = args.aux_struct,
+        lambda_ss    = args.lambda_ss,
+        lambda_mfe   = args.lambda_mfe,
         epochs       = args.epochs,
         batch_size   = args.batch_size,
         lr           = args.lr,

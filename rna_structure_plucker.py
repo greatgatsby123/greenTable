@@ -53,6 +53,11 @@ PAD_ID = NUC_VOCAB['<PAD>']
 # Edge feature channels:  [bp_prob, norm_seq_dist, is_struct_edge]
 N_EDGE_FEATS = 3
 
+# Secondary-structure symbol vocabulary  (dot-bracket)
+SS_VOCAB: Dict[str, int] = {'.': 0, '(': 1, ')': 2}
+N_SS_CLASSES = 3
+SS_IGNORE_IDX = -100   # padding target — ignored by cross-entropy
+
 
 def encode_sequence(seq: str) -> List[int]:
     """Convert a nucleotide string to a list of integer token IDs."""
@@ -88,6 +93,40 @@ def compute_bpp(seq: str) -> np.ndarray:
         return bpp
     except ImportError:
         return np.zeros((L, L), dtype=np.float32)
+
+
+# ─── Secondary-structure / MFE computation ────────────────────────────────────
+
+def compute_ss_mfe(seq: str) -> Tuple[str, float]:
+    """
+    Compute the MFE secondary structure (dot-bracket string) and minimum free
+    energy using ViennaRNA's fast MFE fold (RNA.fold).
+
+    This is the same quantity UTR-LM uses as an auxiliary training target:
+    the dot-bracket string becomes the per-token SS label and the scalar MFE
+    becomes the sequence-level regression target.
+
+    Falls back to an all-unpaired structure and 0.0 kcal/mol if ViennaRNA
+    is not installed.
+
+    Args:
+        seq: Nucleotide string (A/C/G/U/T).
+
+    Returns:
+        (ss, mfe): dot-bracket string of length L and free energy (kcal/mol).
+    """
+    seq_rna = seq.upper().replace('T', 'U')
+    try:
+        import RNA  # ViennaRNA Python bindings
+        structure, mfe = RNA.fold(seq_rna)
+        return structure, float(mfe)
+    except ImportError:
+        return '.' * len(seq), 0.0
+
+
+def encode_ss(ss: str) -> np.ndarray:
+    """Convert a dot-bracket string to integer class IDs (int8 array)."""
+    return np.array([SS_VOCAB.get(c, 0) for c in ss], dtype=np.int8)
 
 
 # ─── Sparse edge builder ───────────────────────────────────────────────────────
@@ -261,6 +300,16 @@ def collate_rna(
         batch['labels'] = torch.tensor(
             [s['label'] for s in samples], dtype=torch.float
         )
+    # Auxiliary SS labels: (B, L_max), padded with SS_IGNORE_IDX (-100)
+    if 'ss_ids' in samples[0]:
+        ss_ids = torch.full((B, L_max), SS_IGNORE_IDX, dtype=torch.long)
+        for i, s in enumerate(samples):
+            L = s['input_ids'].shape[0]
+            ss_ids[i, :L] = torch.from_numpy(s['ss_ids'].astype(np.int64))
+        batch['ss_ids'] = ss_ids
+    # Auxiliary MFE labels: (B,) float
+    if 'mfe' in samples[0]:
+        batch['mfe'] = torch.tensor([float(s['mfe']) for s in samples], dtype=torch.float)
     return batch
 
 
@@ -514,11 +563,18 @@ class RNAStructureGrassmann(nn.Module):
         pooling: str = 'attention',  # 'attention' | 'mean'
         task: str = 'regression',   # 'regression' | 'classification'
         num_libraries: int = 0,     # >0 → add learned per-library bias
+        # ── Auxiliary structure supervision (UTR-LM style) ──────────────────
+        aux_struct: bool = False,   # add SS + MFE prediction heads
+        lambda_ss: float = 0.1,    # weight for per-token SS cross-entropy
+        lambda_mfe: float = 0.01,  # weight for MFE scalar regression
     ):
         super().__init__()
         self.model_dim = model_dim
         self.pooling = pooling
         self.task = task
+        self.aux_struct = aux_struct
+        self.lambda_ss  = lambda_ss
+        self.lambda_mfe = lambda_mfe
 
         # ── Embeddings ────────────────────────────────────────────────────────
         self.token_emb = nn.Embedding(vocab_size, model_dim, padding_idx=PAD_ID)
@@ -558,6 +614,25 @@ class RNAStructureGrassmann(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(model_dim // 2, 1),
         )
+
+        # ── Auxiliary structure heads (UTR-LM style) ───────────────────────────
+        # Both are None when aux_struct=False so they add zero parameters by
+        # default and do not affect existing checkpoints.
+        #
+        # ss_head:  per-token 3-class classifier (.=0, (=1, )=2) applied to the
+        #           full sequence of hidden states h from encode().  This mirrors
+        #           UTR-LM's masked-token SS prediction, except here we predict
+        #           every position rather than only masked ones.
+        #
+        # mfe_head: scalar regression head applied to the pooled representation
+        #           *before* the library-bias is added, because MFE is a
+        #           sequence-intrinsic quantity (library-independent).
+        if aux_struct:
+            self.ss_head  = nn.Linear(model_dim, N_SS_CLASSES)
+            self.mfe_head = nn.Linear(model_dim, 1)
+        else:
+            self.ss_head  = None
+            self.mfe_head = None
 
         # Global init first (touches every nn.Linear, Embedding, LayerNorm)
         self.apply(self._init_weights)
@@ -622,6 +697,8 @@ class RNAStructureGrassmann(nn.Module):
         seq_mask:    torch.Tensor,                    # (B, L) bool
         labels:      Optional[torch.Tensor] = None,   # (B,) float
         library_ids: Optional[torch.Tensor] = None,   # (B,) long
+        ss_labels:   Optional[torch.Tensor] = None,   # (B, L) long — SS class IDs
+        mfe_labels:  Optional[torch.Tensor] = None,   # (B,) float — MFE kcal/mol
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
@@ -632,26 +709,50 @@ class RNAStructureGrassmann(nn.Module):
             seq_mask:     real-token mask for pooling
             labels:       regression targets or binary class labels (0/1)
             library_ids:  integer library condition indices for lib_emb
+            ss_labels:    per-token SS class IDs (0=., 1=(, 2=)); pad with -100
+            mfe_labels:   MFE targets (kcal/mol) — sequence-level float
 
         Returns:
             logits: (B,) raw scalar predictions (no sigmoid for classification)
-            loss:   task-appropriate loss, or None
+            loss:   combined multi-task loss (primary + λ_ss·SS + λ_mfe·MFE),
+                    or None if no labels are provided
         """
-        h = self.encode(input_ids, edge_index, edge_mask, edge_attrs)
-        pooled = self.pool(h, seq_mask)                            # (B, d)
-
-        # Add per-library bias at the representation level
-        if self.lib_emb is not None and library_ids is not None:
-            pooled = pooled + self.lib_emb(library_ids)           # (B, d)
-
-        logits = self.head(pooled).squeeze(-1)                     # (B,)
+        h = self.encode(input_ids, edge_index, edge_mask, edge_attrs)  # (B, L, d)
+        pooled = self.pool(h, seq_mask)                                 # (B, d)
 
         loss = None
+
+        # ── Auxiliary MFE head (sequence-level, before library bias) ──────────
+        # MFE is a property of the sequence alone, so we apply it before the
+        # library-specific bias is added to the pooled vector.
+        if self.aux_struct and mfe_labels is not None:
+            mfe_pred = self.mfe_head(pooled).squeeze(-1)               # (B,)
+            loss = self.lambda_mfe * F.mse_loss(mfe_pred, mfe_labels.float())
+
+        # Add per-library bias at the representation level (primary task only)
+        if self.lib_emb is not None and library_ids is not None:
+            pooled = pooled + self.lib_emb(library_ids)                # (B, d)
+
+        logits = self.head(pooled).squeeze(-1)                         # (B,)
+
+        # ── Primary task loss ─────────────────────────────────────────────────
         if labels is not None:
             if self.task == 'classification':
-                loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+                primary_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
             else:
-                loss = F.mse_loss(logits, labels.float())
+                primary_loss = F.mse_loss(logits, labels.float())
+            loss = primary_loss if loss is None else loss + primary_loss
+
+        # ── Auxiliary SS head (per-token cross-entropy) ───────────────────────
+        if self.aux_struct and ss_labels is not None:
+            ss_logits = self.ss_head(h)                                # (B, L, 3)
+            ss_loss = F.cross_entropy(
+                ss_logits.reshape(-1, N_SS_CLASSES),
+                ss_labels.reshape(-1).long(),
+                ignore_index=SS_IGNORE_IDX,
+            )
+            aux = self.lambda_ss * ss_loss
+            loss = aux if loss is None else loss + aux
 
         return logits, loss
 
