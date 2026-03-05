@@ -256,7 +256,7 @@ def run_experiment(exp: Experiment, output_dir: str,
                    resume_from: Optional[str] = None) -> Optional[Dict]:
     log_path    = os.path.join(output_dir, f'{exp.name}.log')
     exp_out_dir = os.path.join(output_dir, exp.name)
-    eval_every  = 1 if exp.task == 'rlu' else 5
+    eval_every  = 1
 
     cmd = [
         sys.executable, '-u', os.path.join(_HERE, 'train_utr.py'),
