@@ -80,7 +80,7 @@ HAS_GPU     = torch.cuda.is_available()
 DEVICE      = 'cuda' if HAS_GPU else 'cpu'
 BATCH_SIZE  = 256 if HAS_GPU else 64
 NUM_WORKERS = 4   if HAS_GPU else 2
-BPP_CACHE_DIR = os.path.expanduser('~/bpp_cache')
+BPP_CACHE_DIR = os.path.expanduser('/workspace/bpp_cache')
 
 # ─── THREE CONDITIONS ─────────────────────────────────────────────────────────
 
