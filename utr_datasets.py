@@ -50,7 +50,7 @@ except ImportError:
 
 from rna_structure_plucker import (
     preprocess_sample, collate_rna, compute_bpp, N_EDGE_FEATS, PAD_ID,
-    compute_ss_mfe, encode_ss,
+    compute_ss_mfe, encode_ss, MASK_ID, VOCAB_SIZE,
 )
 
 
@@ -533,3 +533,158 @@ def stratified_kfold_indices(
     bins = np.digitize(labels, np.quantile(labels, np.linspace(0, 1, n_bins + 1)[1:-1]))
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     return [(tr, va) for tr, va in skf.split(range(len(labels)), bins)]
+
+
+# ─── Pretraining dataset ──────────────────────────────────────────────────────
+
+class PretrainDataset(Dataset):
+    """
+    Unlabeled sequence dataset for self-supervised pretraining.
+
+    Reads one or more (csv_path, seq_col) sources, deduplicates sequences,
+    and for each sample produces:
+
+        input_ids   -- nucleotide tokens with ~mlm_prob fraction randomly
+                       masked using the BERT 80/10/10 rule
+        mlm_labels  -- original token IDs at masked positions; -100 elsewhere
+        edge_index, edge_mask, edge_attrs, seq_mask
+                    -- same graph tensors as BaseUTRDataset
+        ss_ids      -- per-token dot-bracket class IDs (if aux_struct=True)
+        mfe         -- scalar MFE float32 (if aux_struct=True)
+
+    MLM masking rule (per selected token):
+        80 %  replaced with MASK_ID (= 'N', id 4)
+        10 %  replaced with a random valid nucleotide (A/C/G/U, ids 0-3)
+        10 %  left unchanged  (but still contribute to the MLM loss)
+
+    Sources can be the same CSVs as downstream tasks -- only the sequence
+    column is read; all label columns are ignored.
+
+    Use ``exclude_sources`` to pass held-out test CSVs whose sequences must
+    NOT appear in the pretraining corpus.  This is essential for a clean
+    evaluation: even self-supervised pretraining gives the model a head-start
+    on sequences it has already processed.
+    """
+
+    def __init__(
+        self,
+        sources:         List[Tuple[str, str]],         # [(csv_path, seq_col), ...]
+        bpp_cache:       'BPPCache',
+        max_len:         Optional[int] = None,
+        top_k_struct:    int   = 4,
+        bp_threshold:    float = 0.05,
+        mlm_prob:        float = 0.15,
+        aux_struct:      bool  = True,
+        deduplicate:     bool  = True,
+        rng_seed:        Optional[int] = None,
+        exclude_sources: Optional[List[Tuple[str, str]]] = None,
+        # [(csv_path, seq_col), ...] of test / val CSVs whose sequences must
+        # be excluded from the pretraining corpus for a clean evaluation.
+    ):
+        assert _PANDAS, 'pandas is required: pip install pandas'
+
+        self.bpp_cache    = bpp_cache
+        self.max_len      = max_len
+        self.top_k_struct = top_k_struct
+        self.bp_threshold = bp_threshold
+        self.mlm_prob     = mlm_prob
+        self.aux_struct   = aux_struct
+        self.rng          = np.random.default_rng(rng_seed)
+
+        # Build exclusion set from held-out CSVs (truncated to same max_len)
+        excluded: set = set()
+        for csv_path, seq_col in (exclude_sources or []):
+            df = pd.read_csv(csv_path)
+            for s in df[seq_col].astype(str).str.upper().str.strip():
+                excluded.add(s[:max_len] if max_len else s)
+
+        # Collect and optionally deduplicate sequences across all sources
+        raw: List[str] = []
+        for csv_path, seq_col in sources:
+            df = pd.read_csv(csv_path)
+            raw.extend(df[seq_col].astype(str).str.upper().str.strip().tolist())
+
+        if max_len:
+            raw = [s[:max_len] for s in raw]
+
+        if deduplicate:
+            seen: set = set()
+            self.sequences: List[str] = []
+            for s in raw:
+                if s not in seen and s not in excluded:
+                    seen.add(s)
+                    self.sequences.append(s)
+        else:
+            self.sequences = [s for s in raw if s not in excluded]
+
+        if excluded:
+            n_before = len(raw)
+            n_after  = len(self.sequences)
+            print(f'  PretrainDataset: excluded {n_before - n_after} sequences '
+                  f'that appeared in held-out test/val sources '
+                  f'({n_after} remaining)')
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> Dict:
+        seq = self.sequences[idx]
+
+        # Build graph (same as BaseUTRDataset)
+        bpp    = self.bpp_cache.get(seq)
+        sample = preprocess_sample(
+            seq, bpp,
+            top_k_struct = self.top_k_struct,
+            bp_threshold = self.bp_threshold,
+        )
+
+        # Apply MLM masking (BERT 80/10/10)
+        original_ids = np.array(sample['input_ids'], dtype=np.int64)
+        L            = len(original_ids)
+        mlm_labels   = np.full(L, -100, dtype=np.int64)
+
+        real_pos = original_ids != PAD_ID
+        selected = (self.rng.random(L) < self.mlm_prob) & real_pos
+
+        if selected.any():
+            mlm_labels[selected] = original_ids[selected]
+            masked_ids = original_ids.copy()
+            decision   = self.rng.random(L)
+            # 80 % -> MASK_ID (N)
+            replace  = selected & (decision < 0.8)
+            masked_ids[replace] = MASK_ID
+            # 10 % -> random valid nucleotide (A=0, C=1, G=2, U=3)
+            rand_rep = selected & (decision >= 0.8) & (decision < 0.9)
+            masked_ids[rand_rep] = self.rng.integers(0, 4, size=int(rand_rep.sum()))
+            # 10 % -> unchanged (contribute to loss via mlm_labels)
+            sample['input_ids'] = masked_ids.astype(np.int32)
+
+        sample['mlm_labels'] = mlm_labels
+
+        if self.aux_struct:
+            ss_ids, mfe      = self.bpp_cache.get_ss_mfe(seq)
+            sample['ss_ids'] = ss_ids
+            sample['mfe']    = np.float32(mfe)
+
+        return sample
+
+
+def collate_pretrain(samples: List[Dict]) -> Dict[str, torch.Tensor]:
+    """
+    Collate pretrain samples.
+
+    Extends collate_rna (which handles input_ids, edge tensors, seq_mask,
+    and optionally ss_ids / mfe) with mlm_labels padding.
+    """
+    batch = collate_rna(samples)   # handles ss_ids/mfe if present
+
+    # mlm_labels: pad to L_max with -100
+    if 'mlm_labels' in samples[0]:
+        L_max = batch['input_ids'].shape[1]
+        mlm   = np.full((len(samples), L_max), -100, dtype=np.int64)
+        for i, s in enumerate(samples):
+            lb = s['mlm_labels']
+            mlm[i, :len(lb)] = lb
+        batch['mlm_labels'] = torch.tensor(mlm)
+
+    return batch

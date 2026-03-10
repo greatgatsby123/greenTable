@@ -112,6 +112,10 @@ class TrainConfig:
     test_data:    Optional[str] = None  # if set, use as fixed hold-out instead of CV
     resume_from:  Optional[str] = None  # path to a resume checkpoint to continue training
 
+    # Pretrain-then-finetune
+    pretrained_backbone: Optional[str] = None  # path to pretrain checkpoint; if set,
+                                               # encoder weights are loaded before training
+
 
 def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
@@ -181,6 +185,89 @@ def build_dataset(cfg: TrainConfig):
         )
     else:
         raise ValueError(f'Unknown task: {cfg.task!r}')
+
+
+# ─── Pretrained encoder loader ────────────────────────────────────────────────
+
+def check_pretrain_arch(ckpt_path: str, cfg: 'TrainConfig'):
+    """
+    Raise ValueError if the pretrain checkpoint's architecture does not match
+    the fine-tune config.
+
+    Checks model_dim, num_layers, reduced_dim.  If the checkpoint does not
+    contain a saved config (old format) the check is skipped with a warning.
+    """
+    ckpt       = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    saved_cfg  = ckpt.get('cfg')
+    if saved_cfg is None:
+        import warnings
+        warnings.warn(
+            f'Pretrain checkpoint {ckpt_path!r} has no saved config; '
+            f'cannot verify architecture match.  Proceeding anyway.',
+            stacklevel=3,
+        )
+        return
+
+    mismatches = []
+    for key in ('model_dim', 'num_layers', 'reduced_dim'):
+        pretrain_val = saved_cfg.get(key)
+        finetune_val = getattr(cfg, key, None)
+        if pretrain_val is not None and pretrain_val != finetune_val:
+            mismatches.append(
+                f'  {key}: pretrain={pretrain_val}, fine-tune={finetune_val}'
+            )
+
+    if mismatches:
+        raise ValueError(
+            f'Architecture mismatch between pretrain checkpoint and fine-tune config:\n'
+            + '\n'.join(mismatches)
+            + '\n\nFix: pass --model_dim --num_layers --reduced_dim matching the '
+            f'pretrain run, or use a checkpoint trained with the same architecture.'
+        )
+
+
+def load_pretrained_encoder(model: 'RNAStructureGrassmann', ckpt_path: str) -> int:
+    """
+    Copy encoder weights from a pretrain checkpoint into a fine-tune model.
+
+    The checkpoint can be either:
+      - A file saved by pretrain_utr.py (contains 'encoder_state_dict')
+      - A raw state dict
+
+    Only keys that exist in the model with matching shapes are loaded
+    (strict=False), so task-specific heads and lib_emb are safely ignored.
+
+    Returns the number of parameters loaded.
+    """
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    encoder_sd = ckpt.get('encoder_state_dict', ckpt.get('state_dict', ckpt))
+
+    model_sd = model.state_dict()
+    to_load, skipped = {}, []
+    for k, v in encoder_sd.items():
+        if k in model_sd and model_sd[k].shape == v.shape:
+            to_load[k] = v
+        else:
+            skipped.append(k)
+
+    model.load_state_dict(to_load, strict=False)
+    n_loaded  = sum(v.numel() for v in to_load.values())
+    n_model   = sum(v.numel() for v in model_sd.values())
+    frac      = n_loaded / max(n_model, 1)
+    if skipped:
+        print(f'  Pretrain load: skipped {len(skipped)} keys '
+              f'(shape mismatch or not in fine-tune model)')
+    if frac < 0.5:
+        import warnings
+        warnings.warn(
+            f'Only {frac:.0%} of fine-tune model parameters were initialised '
+            f'from the pretrained checkpoint ({n_loaded:,}/{n_model:,}). '
+            f'This usually means the pretrain and fine-tune architectures differ '
+            f'(num_layers, reduced_dim, model_dim). Make sure both scripts use '
+            f'the same --model_dim --num_layers --reduced_dim.',
+            stacklevel=3,
+        )
+    return n_loaded
 
 
 # ─── Model factory ────────────────────────────────────────────────────────────
@@ -340,12 +427,18 @@ def train_fold(
     model    = build_model(cfg).to(device)
     n_params = model.get_num_params()
 
+    if cfg.pretrained_backbone:
+        check_pretrain_arch(cfg.pretrained_backbone, cfg)
+        n_loaded = load_pretrained_encoder(model, cfg.pretrained_backbone)
+        print(f'  Loaded pretrained encoder: {n_loaded:,} params '
+              f'from {cfg.pretrained_backbone}')
+
     opt = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     total_steps = cfg.epochs * len(train_loader)
     sched  = WarmupCosineScheduler(opt, cfg.warmup_steps, total_steps)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda') if (cfg.use_amp and device.type == 'cuda') else None
 
     best_score   = -np.inf
     best_state:  Optional[Dict] = None
@@ -605,6 +698,9 @@ def parse_args() -> TrainConfig:
                    help='Do not save checkpoints')
     p.add_argument('--resume_from',  default=None,
                    help='Path to a _resume.pt checkpoint to continue training')
+    p.add_argument('--pretrained_backbone', default=None,
+                   help='Path to a pretrain checkpoint (from pretrain_utr.py); '
+                        'encoder weights are loaded before fine-tuning begins')
 
     args = p.parse_args()
     cfg  = TrainConfig(
@@ -639,9 +735,10 @@ def parse_args() -> TrainConfig:
         device       = args.device,
         num_workers  = args.num_workers,
         output_dir   = args.output_dir,
-        save_best    = not args.no_save,
-        test_data    = args.test_data,
-        resume_from  = args.resume_from,
+        save_best            = not args.no_save,
+        test_data            = args.test_data,
+        resume_from          = args.resume_from,
+        pretrained_backbone  = args.pretrained_backbone,
     )
     if args.label_col:
         cfg.label_col = args.label_col

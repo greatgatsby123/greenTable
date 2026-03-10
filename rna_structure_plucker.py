@@ -760,6 +760,189 @@ class RNAStructureGrassmann(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+# ─── Pretrain model ───────────────────────────────────────────────────────────
+
+# Reuse 'N' (ambiguous nucleotide, id=4) as the [MASK] token during MLM.
+# This avoids adding a new vocabulary entry, keeping VOCAB_SIZE=6 unchanged
+# and allowing direct weight transfer to RNAStructureGrassmann.
+MASK_ID: int = NUC_VOCAB['N']   # = 4
+
+
+class RNAPretrainModel(nn.Module):
+    """
+    Self-supervised pretraining model for RNA 5'UTR sequences.
+
+    Shares the exact same encoder architecture as RNAStructureGrassmann
+    (identical attribute names: token_emb, pos_emb, emb_drop, blocks, ln_f,
+    pool_attn) so pretrained weights transfer with a simple strict=False
+    load_state_dict -- no key remapping needed.
+
+    Training objectives:
+        MLM   masked-language modelling (predict original nucleotide for the
+              ~15 % of tokens replaced with MASK_ID=N)            weight: lambda_mlm
+        SS    per-token secondary-structure classification (., (, ))         weight: lambda_ss
+        MFE   sequence-level MFE scalar regression                           weight: lambda_mfe
+
+    After pretraining, call ``get_encoder_state_dict()`` to extract the shared
+    encoder weights for loading into ``RNAStructureGrassmann``.
+    """
+
+    # Top-level attribute names that belong to the shared encoder.
+    # Must match the attribute names in RNAStructureGrassmann exactly.
+    _ENCODER_PREFIXES = frozenset(
+        ('token_emb', 'pos_emb', 'emb_drop', 'blocks', 'ln_f', 'pool_attn')
+    )
+
+    def __init__(
+        self,
+        vocab_size:    int   = VOCAB_SIZE,
+        max_seq_len:   int   = 256,
+        model_dim:     int   = 128,
+        num_layers:    int   = 4,
+        reduced_dim:   int   = 32,
+        ff_dim:        Optional[int] = None,
+        n_edge_feats:  int   = N_EDGE_FEATS,
+        dropout:       float = 0.1,
+        pooling:       str   = 'attention',
+        lambda_mlm:    float = 1.0,
+        lambda_ss:     float = 0.1,
+        lambda_mfe:    float = 0.01,
+    ):
+        super().__init__()
+        self.lambda_mlm = lambda_mlm
+        self.lambda_ss  = lambda_ss
+        self.lambda_mfe = lambda_mfe
+        self.pooling    = pooling
+
+        # -- Encoder (identical layout to RNAStructureGrassmann) ---------------
+        self.token_emb = nn.Embedding(vocab_size, model_dim, padding_idx=PAD_ID)
+        self.pos_emb   = nn.Embedding(max_seq_len, model_dim)
+        self.emb_drop  = nn.Dropout(dropout)
+        self.blocks    = nn.ModuleList([
+            StructureGrassmannBlock(
+                model_dim    = model_dim,
+                reduced_dim  = reduced_dim,
+                ff_dim       = ff_dim,
+                n_edge_feats = n_edge_feats,
+                dropout      = dropout,
+            )
+            for _ in range(num_layers)
+        ])
+        self.ln_f = nn.LayerNorm(model_dim)
+
+        # Attention pooling (same key name as in RNAStructureGrassmann so
+        # pool_attn weights also transfer to the fine-tune model).
+        if pooling == 'attention':
+            self.pool_attn = nn.Linear(model_dim, 1)
+
+        # -- Pretraining heads (not transferred to fine-tune model) ------------
+        self.mlm_head = nn.Linear(model_dim, vocab_size)    # token-level
+        self.ss_head  = nn.Linear(model_dim, N_SS_CLASSES)  # token-level
+        self.mfe_head = nn.Linear(model_dim, 1)             # sequence-level
+
+        # -- Init (same policy as RNAStructureGrassmann) -----------------------
+        self.apply(self._init_weights)
+        for block in self.blocks:
+            nn.init.zeros_(block.plucker_mix.W_attn.weight)
+            nn.init.zeros_(block.plucker_mix.W_attn.bias)
+
+    def _init_weights(self, m: nn.Module):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.padding_idx is not None:
+                m.weight.data[m.padding_idx].zero_()
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def encode(
+        self,
+        input_ids:  torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_mask:  torch.Tensor,
+        edge_attrs: torch.Tensor,
+    ) -> torch.Tensor:              # (B, L, d)
+        B, L = input_ids.shape
+        pos  = torch.arange(L, device=input_ids.device).unsqueeze(0)
+        h    = self.emb_drop(self.token_emb(input_ids) + self.pos_emb(pos))
+        for block in self.blocks:
+            h = block(h, edge_index, edge_mask, edge_attrs)
+        return self.ln_f(h)
+
+    def pool(
+        self,
+        h:        torch.Tensor,  # (B, L, d)
+        seq_mask: torch.Tensor,  # (B, L) bool
+    ) -> torch.Tensor:           # (B, d)
+        if self.pooling == 'attention':
+            logits  = self.pool_attn(h).squeeze(-1)
+            logits  = logits.masked_fill(~seq_mask, torch.finfo(logits.dtype).min / 2)
+            weights = torch.softmax(logits, dim=-1)
+            return (weights.unsqueeze(-1) * h).sum(dim=1)
+        else:
+            h = h.masked_fill(~seq_mask.unsqueeze(-1), 0.0)
+            return h.sum(dim=1) / seq_mask.float().sum(dim=1, keepdim=True)
+
+    def forward(
+        self,
+        input_ids:   torch.Tensor,                    # (B, L)  -- masked tokens
+        edge_index:  torch.Tensor,
+        edge_mask:   torch.Tensor,
+        edge_attrs:  torch.Tensor,
+        seq_mask:    torch.Tensor,                    # (B, L) bool
+        mlm_labels:  Optional[torch.Tensor] = None,   # (B, L) long, -100=ignore
+        ss_labels:   Optional[torch.Tensor] = None,   # (B, L) long, -100=ignore
+        mfe_labels:  Optional[torch.Tensor] = None,   # (B,)   float
+    ) -> torch.Tensor:                                 # scalar total loss
+        h    = self.encode(input_ids, edge_index, edge_mask, edge_attrs)
+        loss = torch.zeros(1, device=input_ids.device, dtype=h.dtype)[0]
+
+        if mlm_labels is not None:
+            mlm_logits = self.mlm_head(h)              # (B, L, V)
+            loss = loss + self.lambda_mlm * F.cross_entropy(
+                mlm_logits.reshape(-1, mlm_logits.size(-1)),
+                mlm_labels.reshape(-1).long(),
+                ignore_index=-100,
+            )
+
+        if ss_labels is not None:
+            ss_logits = self.ss_head(h)                # (B, L, 3)
+            loss = loss + self.lambda_ss * F.cross_entropy(
+                ss_logits.reshape(-1, N_SS_CLASSES),
+                ss_labels.reshape(-1).long(),
+                ignore_index=SS_IGNORE_IDX,
+            )
+
+        if mfe_labels is not None:
+            pooled   = self.pool(h, seq_mask)
+            mfe_pred = self.mfe_head(pooled).squeeze(-1)
+            loss     = loss + self.lambda_mfe * F.mse_loss(mfe_pred, mfe_labels.float())
+
+        return loss
+
+    def get_encoder_state_dict(self) -> Dict:
+        """
+        Return the encoder subset of this model's state dict.
+
+        Keys are identical to those in RNAStructureGrassmann, so they load
+        directly::
+
+            model.load_state_dict(pretrain_model.get_encoder_state_dict(),
+                                  strict=False)
+        """
+        return {
+            k: v for k, v in self.state_dict().items()
+            if k.split('.')[0] in self._ENCODER_PREFIXES
+        }
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
 class UTRDataset(torch.utils.data.Dataset):
