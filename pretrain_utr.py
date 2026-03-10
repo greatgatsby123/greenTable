@@ -64,7 +64,7 @@ class PretrainConfig:
     # a supervision signal (SS/MFE targets).  Use 'mfe' if you want structure
     # to also flow in as graph edges during pretraining (different regime).
     bpp_cache_dir: str   = 'bpp_cache'
-    max_len:       Optional[int] = None
+    max_len:       int   = 256
     mlm_prob:      float = 0.15
     aux_struct:    bool  = True         # add SS + MFE objectives
     deduplicate:   bool  = True
@@ -147,6 +147,7 @@ def build_pretrain_dataset(cfg: PretrainConfig) -> PretrainDataset:
 def build_pretrain_model(cfg: PretrainConfig) -> RNAPretrainModel:
     return RNAPretrainModel(
         vocab_size   = VOCAB_SIZE,
+        max_seq_len  = cfg.max_len,
         model_dim    = cfg.model_dim,
         num_layers   = cfg.num_layers,
         reduced_dim  = cfg.reduced_dim,
@@ -440,7 +441,7 @@ def parse_args() -> PretrainConfig:
                         "structure only as SS/MFE supervision targets. "
                         "'mfe'/'viennarna' = structure also flows in as graph edges.")
     p.add_argument('--bpp_cache_dir', default='bpp_cache')
-    p.add_argument('--max_len',       type=int, default=None)
+    p.add_argument('--max_len',       type=int, default=256)
     p.add_argument('--mlm_prob',      type=float, default=0.15,
                    help='Fraction of tokens masked for MLM')
     p.add_argument('--no_aux_struct', action='store_true',
