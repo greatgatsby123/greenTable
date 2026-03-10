@@ -43,6 +43,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from rna_structure_plucker import RNAPretrainModel, VOCAB_SIZE, N_EDGE_FEATS
 from utr_datasets import BPPCache, PretrainDataset, collate_pretrain, kfold_indices
@@ -176,7 +177,7 @@ def pretrain_epoch(
     total_loss = 0.0
     use_amp    = scaler is not None
 
-    for batch in loader:
+    for batch in tqdm(loader, desc='train', leave=False, dynamic_ncols=True):
         batch      = {k: v.to(device) for k, v in batch.items()}
         mlm_labels = batch.pop('mlm_labels', None)
         ss_labels  = batch.pop('ss_ids', None)
@@ -217,7 +218,7 @@ def pretrain_eval(
     """Return mean total loss on the validation split."""
     model.eval()
     total_loss = 0.0
-    for batch in loader:
+    for batch in tqdm(loader, desc='val', leave=False, dynamic_ncols=True):
         batch      = {k: v.to(device) for k, v in batch.items()}
         mlm_labels = batch.pop('mlm_labels', None)
         ss_labels  = batch.pop('ss_ids', None)
