@@ -333,17 +333,28 @@ class PluckerEncoder(nn.Module):
         self.register_buffer('idx_i', torch.tensor(idx_i, dtype=torch.long))
         self.register_buffer('idx_j', torch.tensor(idx_j, dtype=torch.long))
 
-    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        return_norm: bool = False,
+    ):
         """
         Args:
             u, v: (..., r)   — arbitrary leading batch dimensions
+            return_norm: if True, also return the pre-normalisation wedge norm
 
         Returns:
             p_hat: (..., r*(r-1)/2)  L2-normalised wedge product
+            p_norm: (...) raw wedge norm ‖u ∧ v‖  (only when return_norm=True)
         """
         p = u[..., self.idx_i] * v[..., self.idx_j] \
           - u[..., self.idx_j] * v[..., self.idx_i]
-        return p / p.norm(dim=-1, keepdim=True).clamp(min=self.eps)
+        norm = p.norm(dim=-1, keepdim=True).clamp(min=self.eps)
+        p_hat = p / norm
+        if return_norm:
+            return p_hat, norm.squeeze(-1)
+        return p_hat
 
 
 # ─── Core message-passing layer ────────────────────────────────────────────────
@@ -407,11 +418,12 @@ class StructureEdgePluckerLayer(nn.Module):
 
     def forward(
         self,
-        h: torch.Tensor,            # (B, L, d)  — pre-normed by caller
-        edge_index: torch.Tensor,   # (B, L, K) long, −1 = padding
-        edge_mask: torch.Tensor,    # (B, L, K) bool
-        edge_attrs: torch.Tensor,   # (B, L, K, n_edge_feats)
-    ) -> torch.Tensor:              # (B, L, d)  — delta, NOT the full update
+        h: torch.Tensor,              # (B, L, d)  — pre-normed by caller
+        edge_index: torch.Tensor,     # (B, L, K) long, −1 = padding
+        edge_mask: torch.Tensor,      # (B, L, K) bool
+        edge_attrs: torch.Tensor,     # (B, L, K, n_edge_feats)
+        return_cache: bool = False,
+    ):                                # (B, L, d) or ((B,L,d), cache_dict)
         B, L, d = h.shape
         K = edge_index.shape[2]
         device = h.device
@@ -434,7 +446,10 @@ class StructureEdgePluckerLayer(nn.Module):
         z_nbr  = z_nbr * mask_f
 
         # ── Step 2: Plücker (wedge) features ────────────────────────────────
-        p_hat = self.plucker(z_src, z_nbr)                         # (B, L, K, P)
+        if return_cache:
+            p_hat, p_norm = self.plucker(z_src, z_nbr, return_norm=True)
+        else:
+            p_hat = self.plucker(z_src, z_nbr)                     # (B, L, K, P)
 
         # ── Step 3: map to model dim, conditioned on edge attributes ─────────
         # Multiply by mask_f to zero the W_plu bias at padding slots.
@@ -456,7 +471,8 @@ class StructureEdgePluckerLayer(nn.Module):
         attn_weights = torch.softmax(attn_logits, dim=-1)          # (B, L, K)
 
         # ── Step 5: aggregate ────────────────────────────────────────────────
-        m = (attn_weights.unsqueeze(-1) * m_per_edge).sum(dim=2)  # (B, L, d)
+        weighted_edge_msg = attn_weights.unsqueeze(-1) * m_per_edge  # (B, L, K, d)
+        m = weighted_edge_msg.sum(dim=2)                             # (B, L, d)
 
         # Nodes with no valid neighbours get zero (prevents NaN when all -inf)
         has_nbr = edge_mask.any(dim=-1, keepdim=True).float()
@@ -470,7 +486,21 @@ class StructureEdgePluckerLayer(nn.Module):
         beta = torch.sigmoid(
             self.W_gate(torch.cat([h, m], dim=-1))
         )                                                          # (B, L, d)
-        return (1.0 - beta) * m                                    # delta only
+        delta = (1.0 - beta) * m
+
+        if return_cache:
+            cache = {
+                'safe_idx':          safe_idx,          # (B, L, K)
+                'edge_mask':         edge_mask,          # (B, L, K)
+                'edge_attrs':        edge_attrs,         # (B, L, K, 3)
+                'attn_weights':      attn_weights,       # (B, L, K)
+                'p_hat':             p_hat,              # (B, L, K, P)
+                'p_norm':            p_norm,             # (B, L, K)
+                'm_per_edge':        m_per_edge,         # (B, L, K, d)
+                'weighted_edge_msg': weighted_edge_msg,  # (B, L, K, d)
+            }
+            return delta, cache
+        return delta
 
 
 # ─── Transformer block ────────────────────────────────────────────────────────
@@ -519,11 +549,19 @@ class StructureGrassmannBlock(nn.Module):
         edge_index: torch.Tensor,
         edge_mask: torch.Tensor,
         edge_attrs: torch.Tensor,
-    ) -> torch.Tensor:
+        return_cache: bool = False,
+    ):
         # Pre-norm → layer returns delta → dropout → residual add
-        delta = self.plucker_mix(self.ln1(h), edge_index, edge_mask, edge_attrs)
+        if return_cache:
+            delta, cache = self.plucker_mix(
+                self.ln1(h), edge_index, edge_mask, edge_attrs, return_cache=True
+            )
+        else:
+            delta = self.plucker_mix(self.ln1(h), edge_index, edge_mask, edge_attrs)
         h = h + self.drop(delta)
         h = h + self.ffn(self.ln2(h))
+        if return_cache:
+            return h, cache
         return h
 
 
@@ -660,14 +698,21 @@ class RNAStructureGrassmann(nn.Module):
     # ── Encoding pass ─────────────────────────────────────────────────────────
     def encode(
         self,
-        input_ids:  torch.Tensor,   # (B, L)
-        edge_index: torch.Tensor,   # (B, L, K)
-        edge_mask:  torch.Tensor,   # (B, L, K)
-        edge_attrs: torch.Tensor,   # (B, L, K, n_edge_feats)
-    ) -> torch.Tensor:              # (B, L, d)
+        input_ids:    torch.Tensor,         # (B, L)
+        edge_index:   torch.Tensor,         # (B, L, K)
+        edge_mask:    torch.Tensor,         # (B, L, K)
+        edge_attrs:   torch.Tensor,         # (B, L, K, n_edge_feats)
+        return_cache: bool = False,
+    ):                                      # (B,L,d) or ((B,L,d), [cache, ...])
         B, L = input_ids.shape
         pos = torch.arange(L, device=input_ids.device).unsqueeze(0)
         h = self.emb_drop(self.token_emb(input_ids) + self.pos_emb(pos))
+        if return_cache:
+            layer_caches = []
+            for block in self.blocks:
+                h, cache = block(h, edge_index, edge_mask, edge_attrs, return_cache=True)
+                layer_caches.append(cache)
+            return self.ln_f(h), layer_caches
         for block in self.blocks:
             h = block(h, edge_index, edge_mask, edge_attrs)
         return self.ln_f(h)
@@ -690,16 +735,17 @@ class RNAStructureGrassmann(nn.Module):
     # ── Full forward pass ─────────────────────────────────────────────────────
     def forward(
         self,
-        input_ids:   torch.Tensor,                    # (B, L)
-        edge_index:  torch.Tensor,                    # (B, L, K)
-        edge_mask:   torch.Tensor,                    # (B, L, K)
-        edge_attrs:  torch.Tensor,                    # (B, L, K, n_edge_feats)
-        seq_mask:    torch.Tensor,                    # (B, L) bool
-        labels:      Optional[torch.Tensor] = None,   # (B,) float
-        library_ids: Optional[torch.Tensor] = None,   # (B,) long
-        ss_labels:   Optional[torch.Tensor] = None,   # (B, L) long — SS class IDs
-        mfe_labels:  Optional[torch.Tensor] = None,   # (B,) float — MFE kcal/mol
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_ids:    torch.Tensor,                    # (B, L)
+        edge_index:   torch.Tensor,                    # (B, L, K)
+        edge_mask:    torch.Tensor,                    # (B, L, K)
+        edge_attrs:   torch.Tensor,                    # (B, L, K, n_edge_feats)
+        seq_mask:     torch.Tensor,                    # (B, L) bool
+        labels:       Optional[torch.Tensor] = None,   # (B,) float
+        library_ids:  Optional[torch.Tensor] = None,   # (B,) long
+        ss_labels:    Optional[torch.Tensor] = None,   # (B, L) long — SS class IDs
+        mfe_labels:   Optional[torch.Tensor] = None,   # (B,) float — MFE kcal/mol
+        return_cache: bool = False,                    # XAI: expose layer internals
+    ):
         """
         Args:
             input_ids:    token IDs
@@ -717,7 +763,12 @@ class RNAStructureGrassmann(nn.Module):
             loss:   combined multi-task loss (primary + λ_ss·SS + λ_mfe·MFE),
                     or None if no labels are provided
         """
-        h = self.encode(input_ids, edge_index, edge_mask, edge_attrs)  # (B, L, d)
+        if return_cache:
+            h, layer_caches = self.encode(
+                input_ids, edge_index, edge_mask, edge_attrs, return_cache=True
+            )
+        else:
+            h = self.encode(input_ids, edge_index, edge_mask, edge_attrs)
         pooled = self.pool(h, seq_mask)                                 # (B, d)
 
         loss = None
@@ -754,6 +805,8 @@ class RNAStructureGrassmann(nn.Module):
             aux = self.lambda_ss * ss_loss
             loss = aux if loss is None else loss + aux
 
+        if return_cache:
+            return logits, loss, layer_caches
         return logits, loss
 
     def get_num_params(self) -> int:
