@@ -759,10 +759,15 @@ def position_motif_enrichment(
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
 def _load_model(ckpt_path: str, device: torch.device) -> RNAStructureGrassmann:
-    # TrainConfig is pickled into the checkpoint; import it so unpickling works.
-    from train_utr import TrainConfig, build_model  # noqa: F401
+    import sys
+    import train_utr
+    from train_utr import build_model
+    # The checkpoint was saved while train_utr.py ran as __main__, so pickle
+    # stored TrainConfig as __main__.TrainConfig.  Inject it before torch.load
+    # so the unpickler can find it in the current __main__ namespace.
+    sys.modules['__main__'].TrainConfig = train_utr.TrainConfig
     ckpt  = torch.load(ckpt_path, map_location=device)
-    cfg   = ckpt['cfg']                    # TrainConfig dataclass
+    cfg   = ckpt['cfg']
     model = build_model(cfg)
     model.load_state_dict(ckpt['state_dict'], strict=True)
     model.to(device).eval()
