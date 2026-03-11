@@ -759,15 +759,12 @@ def position_motif_enrichment(
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
 def _load_model(ckpt_path: str, device: torch.device) -> RNAStructureGrassmann:
-    ckpt = torch.load(ckpt_path, map_location=device)
-    cfg  = ckpt.get('config', {})
-    model = RNAStructureGrassmann(
-        model_dim   = cfg.get('model_dim',   128),
-        num_layers  = cfg.get('num_layers',  6),
-        reduced_dim = cfg.get('reduced_dim', 16),
-        dropout     = 0.0,
-    )
-    model.load_state_dict(ckpt['model_state'], strict=False)
+    # TrainConfig is pickled into the checkpoint; import it so unpickling works.
+    from train_utr import TrainConfig, build_model  # noqa: F401
+    ckpt  = torch.load(ckpt_path, map_location=device)
+    cfg   = ckpt['cfg']                    # TrainConfig dataclass
+    model = build_model(cfg)
+    model.load_state_dict(ckpt['state_dict'], strict=True)
     model.to(device).eval()
     return model
 
