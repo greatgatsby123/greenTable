@@ -189,9 +189,10 @@ def edge_table(
     edge_scores_sum = result['edge_scores_sum']  # (L, K)
 
     L = result['seq_len']
-    safe_idx   = caches[0]['safe_idx'][0].numpy()    # (L, K)
-    edge_mask  = caches[0]['edge_mask'][0].numpy()   # (L, K)
-    edge_attrs = caches[0]['edge_attrs'][0].numpy()  # (L, K, 3)
+    safe_idx   = caches[0]['safe_idx'][0].numpy()    # (L_pad, K)
+    edge_mask  = caches[0]['edge_mask'][0].numpy()   # (L_pad, K)
+    edge_attrs = caches[0]['edge_attrs'][0].numpy()  # (L_pad, K, 3)
+    K = edge_mask.shape[1]
 
     # Use layer-averaged attention weights
     attn_stack = np.stack(
