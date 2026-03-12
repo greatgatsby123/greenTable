@@ -47,6 +47,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from rna_structure_plucker import RNAStructureGrassmann
+from rna_bender import RNABenderModel
+from rna_fold import (
+    RNAstralignDataset, collate_rnastralign,
+    aggregate_structure_metrics, structure_metrics,
+    folding_loss, family_kfold_indices, random_family_split,
+)
 from utr_datasets import (
     BPPCache, MRLDataset, TEDataset, IRESDataset, RLUDataset,
     NUM_LIBRARIES, collate_utr, compute_metrics,
@@ -70,6 +76,7 @@ class TrainConfig:
     max_len:      Optional[int] = None # None → auto from task
 
     # Model
+    model_type:   str   = 'plucker'   # plucker | bender
     model_dim:    int   = 128
     num_layers:   int   = 4
     reduced_dim:  int   = 32
@@ -84,6 +91,19 @@ class TrainConfig:
     aux_struct:   bool  = False        # add SS + MFE auxiliary prediction heads
     lambda_ss:    float = 0.1          # weight for per-token SS cross-entropy
     lambda_mfe:   float = 0.01         # weight for scalar MFE regression
+
+    # RNA Bender geometric losses (active only when model_type='bender')
+    lambda_curv:  float = 0.01         # curvature regularisation weight
+    lambda_cons:  float = 0.0          # backbone–pairing consistency weight (disabled by default)
+    lambda_pair:  float = 0.1          # pair-map (BPP supervision) weight
+    use_pair_head:bool  = True         # include pair-map head
+
+    # RNAstralign / folding task
+    data_format:  str   = 'csv'        # 'csv' or 'bpseq' (rnastralign task only)
+    struct_col:   Optional[str] = None # dot-bracket column name (csv format)
+    family_col:   Optional[str] = None # family column name (csv format)
+    family_split: bool  = True         # use family-aware GroupKFold (rnastralign)
+    oracle_edges: bool  = True         # include ground-truth base pairs as graph edges
 
     # Training
     epochs:       int   = 60
@@ -119,6 +139,15 @@ class TrainConfig:
 
 def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
+    if cfg.task == 'rnastralign':
+        # Folding task: column defaults differ from UTR tasks
+        if cfg.seq_col    is None: cfg.seq_col    = 'sequence'
+        if cfg.struct_col is None: cfg.struct_col = 'structure'
+        if cfg.family_col is None: cfg.family_col = 'family'
+        if cfg.device == 'auto':
+            cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        return cfg
+
     task_defaults = {
         # Column names match capsule-4214075-data files exactly
         'mrl':  dict(label_col='rl',                      seq_col='utr',                     max_len=50),
@@ -141,6 +170,18 @@ def _auto_fill(cfg: TrainConfig) -> TrainConfig:
 
 def build_dataset(cfg: TrainConfig):
     """Instantiate the right dataset class for the given task."""
+    if cfg.task == 'rnastralign':
+        return RNAstralignDataset(
+            cfg.data,
+            data_format             = cfg.data_format,
+            seq_col                 = cfg.seq_col    or 'sequence',
+            struct_col              = cfg.struct_col or 'structure',
+            family_col              = cfg.family_col or 'family',
+            max_len                 = cfg.max_len,
+            top_k_struct            = 4,
+            use_oracle_struct_edges = cfg.oracle_edges,
+        )
+
     cache = BPPCache(os.path.expanduser(cfg.bpp_cache_dir), backend=cfg.bpp_backend)
     common = dict(
         bpp_cache=cache,
@@ -272,10 +313,36 @@ def load_pretrained_encoder(model: 'RNAStructureGrassmann', ckpt_path: str) -> i
 
 # ─── Model factory ────────────────────────────────────────────────────────────
 
-def build_model(cfg: TrainConfig) -> RNAStructureGrassmann:
-    task_type = 'classification' if cfg.task == 'ires' else 'regression'
+def build_model(cfg: TrainConfig):
+    is_folding    = cfg.task == 'rnastralign'
+    task_type     = 'classification' if cfg.task == 'ires' else 'regression'
     num_libraries = NUM_LIBRARIES if cfg.task == 'mrl' and cfg.lib_col else 0
 
+    if cfg.model_type == 'bender':
+        # For the folding task:
+        #   task='folding'    → skips building the pooled task head entirely
+        #   aux_struct=True   → SS head is a primary output, not optional
+        bender_task = 'folding' if is_folding else task_type
+        aux_struct  = True      if is_folding else cfg.aux_struct
+        return RNABenderModel(
+            model_dim     = cfg.model_dim,
+            num_layers    = cfg.num_layers,
+            reduced_dim   = cfg.reduced_dim,
+            ff_dim        = cfg.ff_dim,
+            dropout       = cfg.dropout,
+            pooling       = cfg.pooling,
+            task          = bender_task,
+            num_libraries = num_libraries,
+            aux_struct    = aux_struct,
+            lambda_ss     = cfg.lambda_ss,
+            lambda_mfe    = cfg.lambda_mfe,
+            use_pair_head = cfg.use_pair_head,
+            lambda_pair   = cfg.lambda_pair,
+            lambda_curv   = cfg.lambda_curv,
+            lambda_cons   = cfg.lambda_cons,
+        )
+
+    # Default: original structure-edge Plücker model
     return RNAStructureGrassmann(
         model_dim    = cfg.model_dim,
         num_layers   = cfg.num_layers,
@@ -307,33 +374,65 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
 
 
 def train_epoch(
-    model: RNAStructureGrassmann,
+    model,
     loader: DataLoader,
     optimiser: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     device: torch.device,
-    clip_grad: float = 1.0,
-    scaler: Optional['torch.cuda.amp.GradScaler'] = None,
+    clip_grad:        float = 1.0,
+    scaler:           Optional['torch.cuda.amp.GradScaler'] = None,
+    compute_loss_fn   = None,   # callable(outputs_dict, batch) -> Tensor
+                                # if None, falls back to old (logits, loss) API
 ) -> float:
+    """
+    One training epoch.
+
+    Two calling conventions are supported:
+
+    Old API (RNAStructureGrassmann):
+        _, loss = model(**inputs, labels=labels, ...)
+        compute_loss_fn should be None.
+
+    New API (RNABenderModel / folding task):
+        outputs = model(**inputs)        # returns dict
+        loss    = compute_loss_fn(outputs, batch)
+        compute_loss_fn must be provided.
+    """
     model.train()
     total_loss = 0.0
     use_amp    = scaler is not None
-    for batch in loader:
-        batch      = {k: v.to(device) for k, v in batch.items()}
-        labels     = batch.pop('labels', None)
-        lib_ids    = batch.pop('library_ids', None)
-        ss_labels  = batch.pop('ss_ids', None)   # present only when aux_struct=True
-        mfe_labels = batch.pop('mfe', None)       # present only when aux_struct=True
 
-        optimiser.zero_grad()
-        with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-            _, loss = model(
-                **batch,
-                labels=labels,
-                library_ids=lib_ids,
-                ss_labels=ss_labels,
-                mfe_labels=mfe_labels,
-            )
+    for batch in loader:
+        # Move all tensor values to device; keep non-tensor items (e.g. 'families') aside
+        batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+
+        if compute_loss_fn is not None:
+            # ── New dict API ──────────────────────────────────────────────────
+            optimiser.zero_grad()
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+                # Forward: strip non-tensor keys the model doesn't accept
+                model_inputs = {k: v for k, v in batch.items()
+                                if isinstance(v, torch.Tensor)
+                                and k not in ('pair_targets', 'ss_labels', 'families')}
+                outputs = model(**model_inputs)
+                loss    = compute_loss_fn(outputs, batch)
+        else:
+            # ── Old (logits, loss) API ────────────────────────────────────────
+            labels     = batch.pop('labels', None)
+            lib_ids    = batch.pop('library_ids', None)
+            ss_labels  = batch.pop('ss_ids', None)
+            mfe_labels = batch.pop('mfe', None)
+
+            optimiser.zero_grad()
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+                result = model(**batch, labels=labels, library_ids=lib_ids,
+                               ss_labels=ss_labels, mfe_labels=mfe_labels)
+                # result is either (logits, loss) or a dict with 'loss'
+                if isinstance(result, dict):
+                    loss = result['loss']
+                else:
+                    _, loss = result
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -354,24 +453,34 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: RNAStructureGrassmann,
-    loader: DataLoader,
-    device: torch.device,
-    task: str = 'regression',
+    model,
+    loader:    DataLoader,
+    device:    torch.device,
+    task:      str = 'regression',   # 'regression' | 'classification' | 'rnastralign'
 ) -> Dict[str, float]:
     model.eval()
+
+    if task == 'rnastralign':
+        return _evaluate_structure(model, loader, device)
+
     all_preds:  List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
 
     for batch in loader:
-        batch   = {k: v.to(device) for k, v in batch.items()}
+        batch   = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                   for k, v in batch.items()}
         labels  = batch.pop('labels', None)
         lib_ids = batch.pop('library_ids', None)
-        # Pop aux labels so they don't reach forward() — evaluation uses
-        # primary-task logits only; auxiliary losses are not computed here.
         batch.pop('ss_ids', None)
         batch.pop('mfe', None)
-        logits, _ = model(**batch, library_ids=lib_ids)
+        batch.pop('families', None)
+
+        result = model(**batch, library_ids=lib_ids)
+        if isinstance(result, dict):
+            logits = result['task_logits']
+        else:
+            logits, _ = result
+
         all_preds.append(logits.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
@@ -380,13 +489,77 @@ def evaluate(
     return compute_metrics(preds, labels, task=task)
 
 
+@torch.no_grad()
+def _evaluate_structure(model, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    """Evaluate pair P/R/F1/MCC and SS accuracy for the rnastralign task."""
+    per_seq: List[Dict[str, float]] = []
+
+    for batch in loader:
+        batch        = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in batch.items()}
+        pair_targets = batch.pop('pair_targets')       # (B, L, L)
+        ss_labels    = batch.pop('ss_labels', None)    # (B, L)
+        seq_mask     = batch['seq_mask']               # (B, L)
+        batch.pop('families', None)
+
+        result = model(**{k: v for k, v in batch.items() if isinstance(v, torch.Tensor)})
+        if isinstance(result, dict):
+            pair_logits = result.get('pair_logits')
+            ss_logits   = result.get('ss_logits')
+        else:
+            pair_logits, ss_logits = None, None
+
+        if pair_logits is None:
+            continue
+
+        B = pair_logits.shape[0]
+        for b in range(B):
+            seq_len = int(seq_mask[b].sum().item())
+            m = structure_metrics(
+                pair_logits[b].cpu().numpy(),
+                pair_targets[b].cpu().numpy(),
+                ss_logits[b].cpu().numpy()   if ss_logits   is not None else None,
+                ss_labels[b].cpu().numpy()   if ss_labels   is not None else None,
+                seq_len=seq_len,
+            )
+            per_seq.append(m)
+
+    return aggregate_structure_metrics(per_seq)
+
+
 # ─── Primary metric (for early stopping and fold ranking) ─────────────────────
 
 def primary_metric(metrics: Dict[str, float], task: str) -> float:
-    """Higher is always better (negate MSE for regression)."""
+    """Higher is always better."""
     if task == 'classification':
         return metrics['aupr']
+    if task == 'rnastralign':
+        return metrics.get('pair_f1', 0.0)
     return metrics.get('spearman_r', metrics.get('pearson_r', -metrics['mse']))
+
+
+# ─── Folding loss factory ─────────────────────────────────────────────────────
+
+def _make_folding_loss_fn(cfg: 'TrainConfig'):
+    """Return a compute_loss_fn(outputs, batch) callable for the rnastralign task."""
+    lp   = cfg.lambda_pair
+    ls   = cfg.lambda_ss
+    lc   = cfg.lambda_curv
+    lco  = cfg.lambda_cons
+
+    def _loss(outputs, batch):
+        return folding_loss(
+            outputs,
+            pair_targets = batch['pair_targets'],
+            ss_labels    = batch.get('ss_labels'),
+            seq_mask     = batch.get('seq_mask'),
+            lambda_pair  = lp,
+            lambda_ss    = ls,
+            lambda_curv  = lc,
+            lambda_cons  = lco,
+        )
+
+    return _loss
 
 
 # ─── Single fold training ─────────────────────────────────────────────────────
@@ -407,20 +580,31 @@ def train_fold(
     val_idx)).  If test_dataset is provided it is evaluated exactly once at
     the end with the best checkpoint — it is never seen during model selection.
     """
-    device  = torch.device(cfg.device)
-    task    = 'classification' if cfg.task == 'ires' else 'regression'
+    device = torch.device(cfg.device)
+    if cfg.task == 'rnastralign':
+        task        = 'rnastralign'
+        collate_fn  = collate_rnastralign
+        loss_fn     = _make_folding_loss_fn(cfg)
+    elif cfg.task == 'ires':
+        task        = 'classification'
+        collate_fn  = collate_utr
+        loss_fn     = None
+    else:
+        task        = 'regression'
+        collate_fn  = collate_utr
+        loss_fn     = None
 
     train_ds = Subset(dataset, train_idx)
     val_ds   = val_dataset if val_dataset is not None else Subset(dataset, val_idx)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=collate_utr, num_workers=cfg.num_workers,
+        collate_fn=collate_fn, num_workers=cfg.num_workers,
         pin_memory=(cfg.device != 'cpu'),
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size * 2, shuffle=False,
-        collate_fn=collate_utr, num_workers=cfg.num_workers,
+        collate_fn=collate_fn, num_workers=cfg.num_workers,
         pin_memory=(cfg.device != 'cpu'),
     )
 
@@ -477,7 +661,7 @@ def train_fold(
     for epoch in range(start_epoch, cfg.epochs + 1):
         t0         = time.time()
         train_loss = train_epoch(model, train_loader, opt, sched, device,
-                                 cfg.clip_grad, scaler)
+                                 cfg.clip_grad, scaler, compute_loss_fn=loss_fn)
         elapsed    = time.time() - t0
 
         # ── Periodic evaluation & early stopping ─────────────────────────────
@@ -533,7 +717,7 @@ def train_fold(
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         test_loader = DataLoader(
             test_dataset, batch_size=cfg.batch_size * 2, shuffle=False,
-            collate_fn=collate_utr, num_workers=cfg.num_workers,
+            collate_fn=collate_fn, num_workers=cfg.num_workers,
             pin_memory=(cfg.device != 'cpu'),
         )
         test_metrics = evaluate(model, test_loader, device, task)
@@ -563,7 +747,7 @@ def _resume_ckpt(epoch, model, opt, sched, scaler,
     }
 
 
-# ─── Cross-validation orchestrator ───────────────────────────────────────────
+# ─── Cross-validation orchestrator ─────────────��─────────────────────────────
 
 def run_cv(cfg: TrainConfig):
     """Full cross-validation run; prints aggregate statistics."""
@@ -571,33 +755,46 @@ def run_cv(cfg: TrainConfig):
     np.random.seed(cfg.seed)
 
     print(f'Task: {cfg.task} | Data: {cfg.data} | Device: {cfg.device}')
-    print(f'Model: dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
+    print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
     print(f'BPP backend: {cfg.bpp_backend} | Folds: {cfg.folds}')
     if cfg.aux_struct:
         print(f'Aux struct: ON  (λ_ss={cfg.lambda_ss}, λ_mfe={cfg.lambda_mfe})')
+    if cfg.model_type == 'bender':
+        print(f'Bender losses: λ_curv={cfg.lambda_curv} λ_cons={cfg.lambda_cons} λ_pair={cfg.lambda_pair}')
 
     dataset = build_dataset(cfg)
     n       = len(dataset)
-    task    = 'classification' if cfg.task == 'ires' else 'regression'
+    if cfg.task == 'rnastralign':
+        task = 'rnastralign'
+    elif cfg.task == 'ires':
+        task = 'classification'
+    else:
+        task = 'regression'
     print(f'Dataset: {n} sequences | task={task}')
 
     # Build fold splits
     hold_out_ds: Optional[object] = None   # test set, evaluated once at the end
     if cfg.test_data is not None:
-        # Fixed hold-out protocol (e.g. MRL pre-split libraries):
-        #   • Carve a val split from the TRAINING data for early stopping.
-        #   • The test CSV is only evaluated once, after training, with the
-        #     best checkpoint — it never touches model selection.
         test_cfg    = dataclasses.replace(cfg, data=cfg.test_data)
         hold_out_ds = build_dataset(test_cfg)
         idx   = np.random.permutation(n)
-        split = int(n * (1 - cfg.val_frac))   # e.g. 90 % train, 10 % val
+        split = int(n * (1 - cfg.val_frac))
         folds = [(idx[:split], idx[split:])]
-        val_datasets = [None]                  # use Subset(dataset, val_idx)
+        val_datasets = [None]
         print(f'Hold-out split: {split} train / {n - split} val '
               f'(val from train CSV, test CSV evaluated once at end)')
+    elif cfg.task == 'rnastralign' and cfg.family_split:
+        # Family-aware splitting: keeps every RNA family entirely in one split
+        families = [dataset[i]['family'] for i in range(n)]
+        if cfg.folds == 1:
+            tr, va   = random_family_split(families, cfg.val_frac, cfg.seed)
+            folds    = [(tr, va)]
+        else:
+            folds    = family_kfold_indices(families, k=cfg.folds, seed=cfg.seed)
+        val_datasets = [None] * len(folds)
+        n_fam = len(set(families))
+        print(f'Family-aware split: {n_fam} families across {len(folds)} fold(s)')
     elif cfg.folds == 1:
-        # Single 80/20 random split
         idx     = np.random.permutation(n)
         split   = int(n * (1 - cfg.val_frac))
         folds   = [(idx[:split], idx[split:])]
@@ -634,7 +831,7 @@ def parse_args() -> TrainConfig:
     )
     # Data
     p.add_argument('--task',         default='mrl',
-                   choices=['mrl', 'te', 'el', 'ires', 'rlu'])
+                   choices=['mrl', 'te', 'el', 'ires', 'rlu', 'rnastralign'])
     p.add_argument('--data',         required=True,
                    help='Path to input CSV file')
     p.add_argument('--bpp_backend',  default='mfe',
@@ -656,6 +853,10 @@ def parse_args() -> TrainConfig:
                    help='Fixed hold-out test CSV; if set, trains on --data and '
                         'evaluates on --test_data instead of doing CV')
     # Model
+    p.add_argument('--model_type',   default='plucker',
+                   choices=['plucker', 'bender'],
+                   help='plucker = original StructureEdgePlucker; '
+                        'bender  = RNA Bender with curvature and multi-head geometry')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--reduced_dim',  type=int,   default=32)
@@ -671,6 +872,27 @@ def parse_args() -> TrainConfig:
                    help='Loss weight for the auxiliary SS cross-entropy term')
     p.add_argument('--lambda_mfe',   type=float, default=0.01,
                    help='Loss weight for the auxiliary MFE MSE term')
+    # RNA Bender geometric losses
+    p.add_argument('--lambda_curv',  type=float, default=0.01,
+                   help='[bender] Curvature regularisation weight')
+    p.add_argument('--lambda_cons',  type=float, default=0.0,
+                   help='[bender] Backbone–pairing consistency loss weight (default off)')
+    p.add_argument('--lambda_pair',  type=float, default=0.1,
+                   help='[bender] Pair-map (BPP supervision) loss weight')
+    p.add_argument('--no_pair_head', action='store_true',
+                   help='[bender] Disable the pair-map output head')
+    # RNAstralign / folding
+    p.add_argument('--data_format',  default='csv', choices=['csv', 'json', 'bpseq'],
+                   help='[rnastralign] Input format: csv, json dict, or bpseq directory')
+    p.add_argument('--struct_col',   default=None,
+                   help='[rnastralign/csv] Dot-bracket column name')
+    p.add_argument('--family_col',   default=None,
+                   help='[rnastralign/csv] Family label column name')
+    p.add_argument('--no_family_split', action='store_true',
+                   help='[rnastralign] Disable family-aware splits; use random splits instead')
+    p.add_argument('--no_oracle_edges', action='store_true',
+                   help='[rnastralign] Use only local/backbone edges; no ground-truth base '
+                        'pairs in the input graph (sequence-only ablation)')
     # Training
     p.add_argument('--epochs',       type=int,   default=60)
     p.add_argument('--batch_size',   type=int,   default=64)
@@ -712,6 +934,12 @@ def parse_args() -> TrainConfig:
         lib_col      = args.lib_col,
         cell_line    = args.cell_line,
         max_len      = args.max_len,
+        data_format  = args.data_format,
+        struct_col   = args.struct_col,
+        family_col   = args.family_col,
+        family_split = not args.no_family_split,
+        oracle_edges = not args.no_oracle_edges,
+        model_type   = args.model_type,
         model_dim    = args.model_dim,
         num_layers   = args.num_layers,
         reduced_dim  = args.reduced_dim,
@@ -720,6 +948,10 @@ def parse_args() -> TrainConfig:
         aux_struct   = args.aux_struct,
         lambda_ss    = args.lambda_ss,
         lambda_mfe   = args.lambda_mfe,
+        lambda_curv  = args.lambda_curv,
+        lambda_cons  = args.lambda_cons,
+        lambda_pair  = args.lambda_pair,
+        use_pair_head= not args.no_pair_head,
         epochs       = args.epochs,
         batch_size   = args.batch_size,
         lr           = args.lr,
