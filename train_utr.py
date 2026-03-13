@@ -48,6 +48,7 @@ from torch.utils.data import DataLoader, Subset
 
 from rna_structure_plucker import RNAStructureGrassmann
 from rna_bender import RNABenderModel
+from rna_baseline import RNATransformerBaseline
 from rna_fold import (
     RNAstralignDataset, collate_rnastralign,
     aggregate_structure_metrics, structure_metrics,
@@ -76,9 +77,10 @@ class TrainConfig:
     max_len:      Optional[int] = None # None → auto from task
 
     # Model
-    model_type:   str   = 'plucker'   # plucker | bender
+    model_type:   str   = 'plucker'   # plucker | bender | transformer
     model_dim:    int   = 128
     num_layers:   int   = 4
+    num_heads:    int   = 8            # transformer baseline only
     reduced_dim:  int   = 32
     ff_dim:       Optional[int] = None # default: 4*model_dim
     dropout:      float = 0.1
@@ -317,6 +319,24 @@ def build_model(cfg: TrainConfig):
     is_folding    = cfg.task == 'rnastralign'
     task_type     = 'classification' if cfg.task == 'ires' else 'regression'
     num_libraries = NUM_LIBRARIES if cfg.task == 'mrl' and cfg.lib_col else 0
+
+    if cfg.model_type == 'transformer':
+        # Standard MHA baseline — sequence-only, same output heads as Bender.
+        # Edge inputs are accepted but ignored; curvature/consistency losses = 0.
+        tf_task    = 'folding' if is_folding else task_type
+        aux_struct = True      if is_folding else cfg.aux_struct
+        return RNATransformerBaseline(
+            model_dim     = cfg.model_dim,
+            num_layers    = cfg.num_layers,
+            num_heads     = cfg.num_heads,
+            ff_dim        = cfg.ff_dim,
+            dropout       = cfg.dropout,
+            pooling       = cfg.pooling,
+            task          = tf_task,
+            num_libraries = num_libraries,
+            aux_struct    = aux_struct,
+            use_pair_head = cfg.use_pair_head,
+        )
 
     if cfg.model_type == 'bender':
         # For the folding task:
@@ -705,7 +725,7 @@ def train_fold(
     print(f'  Best @ epoch {best_epoch}: '
           + ' | '.join(f'{k}={v:.4f}' for k, v in best_metrics.items()))
 
-    # ── Save best model weights ───────────────────────────────────────────────
+    # ── Save best model weights ─────────────────────────────────────���─────────
     if cfg.save_best and best_state is not None:
         best_path = os.path.join(cfg.output_dir, f'{cfg.task}_fold{fold_num}_best.pt')
         torch.save({'state_dict': best_state, 'metrics': best_metrics, 'cfg': cfg},
@@ -755,7 +775,10 @@ def run_cv(cfg: TrainConfig):
     np.random.seed(cfg.seed)
 
     print(f'Task: {cfg.task} | Data: {cfg.data} | Device: {cfg.device}')
-    print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
+    if cfg.model_type == 'transformer':
+        print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} heads={cfg.num_heads}')
+    else:
+        print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
     print(f'BPP backend: {cfg.bpp_backend} | Folds: {cfg.folds}')
     if cfg.aux_struct:
         print(f'Aux struct: ON  (λ_ss={cfg.lambda_ss}, λ_mfe={cfg.lambda_mfe})')
@@ -854,11 +877,14 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender'],
-                   help='plucker = original StructureEdgePlucker; '
-                        'bender  = RNA Bender with curvature and multi-head geometry')
+                   choices=['plucker', 'bender', 'transformer'],
+                   help='plucker      = original StructureEdgePlucker; '
+                        'bender       = RNA Bender with Grassmann curvature; '
+                        'transformer  = standard MHA baseline (sequence-only)')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
+    p.add_argument('--num_heads',    type=int,   default=8,
+                   help='[transformer] Number of attention heads')
     p.add_argument('--reduced_dim',  type=int,   default=32)
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--pooling',      default='attention',
@@ -942,6 +968,7 @@ def parse_args() -> TrainConfig:
         model_type   = args.model_type,
         model_dim    = args.model_dim,
         num_layers   = args.num_layers,
+        num_heads    = args.num_heads,
         reduced_dim  = args.reduced_dim,
         dropout      = args.dropout,
         pooling      = args.pooling,
