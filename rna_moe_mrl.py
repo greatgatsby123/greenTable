@@ -200,10 +200,14 @@ class RNAMoEMRLModel(nn.Module):
 
     def forward(
         self,
-        input_ids:   torch.Tensor,            # (B, L)
-        edge_idx:    torch.Tensor,            # (B, L, K)
-        edge_feat:   torch.Tensor,            # (B, L, K, E)
-        seq_mask:    torch.Tensor,            # (B, L) bool
+        input_ids:   torch.Tensor,                    # (B, L)
+        seq_mask:    torch.Tensor,                    # (B, L) bool
+        # Folding-collate names (rnastralign)
+        edge_idx:    Optional[torch.Tensor] = None,   # (B, L, K)
+        edge_feat:   Optional[torch.Tensor] = None,   # (B, L, K, E)
+        # UTR-collate aliases (collate_rna)
+        edge_index:  Optional[torch.Tensor] = None,
+        edge_attrs:  Optional[torch.Tensor] = None,
         labels:      Optional[torch.Tensor] = None,   # (B,) for built-in MSE loss
         library_ids: Optional[torch.Tensor] = None,
         **kwargs,
@@ -215,6 +219,10 @@ class RNAMoEMRLModel(nn.Module):
             loss         : scalar MSE (only when labels is not None)
             kappa_list, p_bb1_list, p_struct_list, edge_feat   (geometry internals)
         """
+        # Normalise edge tensor names: accept both collate_rna and collate_rnastralign keys
+        edge_idx  = edge_idx  if edge_idx  is not None else edge_index
+        edge_feat = edge_feat if edge_feat is not None else edge_attrs
+
         # Branch A
         _, seq_pool, _        = self.seq_encoder.encode(input_ids, seq_mask)
 
