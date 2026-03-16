@@ -16,6 +16,7 @@ Usage (same as RNABenderModel):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
@@ -224,6 +225,16 @@ class RNATransformerBaseline(nn.Module):
             if self.lib_emb is not None and library_ids is not None:
                 pooled = pooled + self.lib_emb(library_ids)
             out['task_logits'] = self.task_head(pooled).squeeze(-1)   # (B,)
+
+            # Built-in primary loss — mirrors RNABenderModel behaviour so that
+            # train_epoch's old-API path (no compute_loss_fn) works unchanged.
+            if labels is not None:
+                if self.task == 'classification':
+                    out['loss'] = F.binary_cross_entropy_with_logits(
+                        out['task_logits'], labels.float()
+                    )
+                else:
+                    out['loss'] = F.mse_loss(out['task_logits'], labels.float())
 
         return out
 
