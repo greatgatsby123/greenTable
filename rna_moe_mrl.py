@@ -68,6 +68,7 @@ class RNAMoEMRLModel(nn.Module):
         geom_num_layers:  int             = 4,
         geom_reduced_dim: int             = 32,
         geom_ff_dim:      Optional[int]   = None,
+        geom_max_len:     Optional[int]   = None,   # if None, uses shared max_len
         # Shared
         vocab_size:       int             = VOCAB_SIZE,
         max_len:          int             = 256,
@@ -95,9 +96,14 @@ class RNAMoEMRLModel(nn.Module):
         )
 
         # ── Branch B: geometry ────────────────────────────────────────────────
+        # geom_max_len lets the geom branch use a different positional range
+        # than the seq branch — needed when loading a checkpoint pretrained on
+        # longer sequences (e.g. RNAstralign max_len=256) for a short-seq task
+        # (e.g. UTR max_len=50).
+        _geom_max_len = geom_max_len if geom_max_len is not None else max_len
         self.geom_encoder = RNABenderEncoder(
             vocab_size  = vocab_size,
-            max_len     = max_len,
+            max_len     = _geom_max_len,
             model_dim   = model_dim,
             num_layers  = geom_num_layers,
             reduced_dim = geom_reduced_dim,

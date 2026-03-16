@@ -399,13 +399,34 @@ def build_model(cfg: TrainConfig):
 
     if cfg.model_type == 'moe':
         # Two-branch MoE: sequence encoder + geometry (Bender) encoder + learned gate.
-        # The geometry branch can be initialised from a pretrained structure checkpoint.
+        # When a pretrained geom encoder is supplied, auto-read its architecture so
+        # the geom branch is always built to match the saved weights exactly.
+        geom_layers  = cfg.geom_num_layers
+        geom_r       = cfg.reduced_dim
+        geom_max_len = None   # None → use shared max_len
+
+        if cfg.pretrained_geom_encoder:
+            try:
+                _ckpt = torch.load(cfg.pretrained_geom_encoder, map_location='cpu',
+                                   weights_only=False)
+                _cc = _ckpt.get('cfg', {})
+                if _cc:
+                    geom_layers  = _cc.get('num_layers',  geom_layers)
+                    geom_r       = _cc.get('reduced_dim', geom_r)
+                    geom_max_len = _cc.get('max_len') or geom_max_len
+                    print(f'  [info] Geom branch arch from checkpoint: '
+                          f'layers={geom_layers} r={geom_r} max_len={geom_max_len}')
+            except Exception as e:
+                print(f'  [warn] Could not read pretrained geom cfg: {e}')
+            _check_pretrained_geom_arch(cfg)
+
         model = RNAMoEMRLModel(
             model_dim        = cfg.model_dim,
             seq_num_layers   = cfg.num_layers,
             seq_num_heads    = cfg.num_heads,
-            geom_num_layers  = cfg.geom_num_layers,
-            geom_reduced_dim = cfg.reduced_dim,
+            geom_num_layers  = geom_layers,
+            geom_reduced_dim = geom_r,
+            geom_max_len     = geom_max_len,
             vocab_size       = VOCAB_SIZE,
             max_len          = cfg.max_len or 256,
             dropout          = cfg.dropout,
@@ -415,7 +436,6 @@ def build_model(cfg: TrainConfig):
             gate_bias        = cfg.gate_bias,
         )
         if cfg.pretrained_geom_encoder:
-            _check_pretrained_geom_arch(cfg)
             model.load_pretrained_geom(cfg.pretrained_geom_encoder)
         return model
 
