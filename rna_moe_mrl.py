@@ -112,6 +112,16 @@ class RNAMoEMRLModel(nn.Module):
             pooling     = pooling,
         )
 
+        # ── Branch alignment projections ──────────────────────────────────────
+        # Each branch's pooled vector lives in a different representation space
+        # (seq: attention-based; geom: Grassmann geometry-based). A learned
+        # linear + LayerNorm maps both into a shared space before gating/fusion,
+        # preventing the gate from having to compensate for scale/basis mismatch.
+        self.seq_align  = nn.Sequential(nn.Linear(model_dim, model_dim),
+                                        nn.LayerNorm(model_dim))
+        self.geom_align = nn.Sequential(nn.Linear(model_dim, model_dim),
+                                        nn.LayerNorm(model_dim))
+
         # ── Fusion gate ────────────────────────────────────────────────────────
         gate_out = 1 if gate_type == 'scalar' else model_dim
         self.gate = nn.Sequential(
@@ -237,12 +247,16 @@ class RNAMoEMRLModel(nn.Module):
             input_ids, edge_idx, edge_feat, seq_mask
         )
 
+        # Align both branches into a shared representation space before gating
+        seq_pool_a  = self.seq_align(seq_pool)
+        geom_pool_a = self.geom_align(geom_pool)
+
         # Gate — alpha is the SEQUENCE weight: alpha→1 means "use seq", alpha→0 means "use geom"
         # Logged as gate_mean/gate_std in evaluate(); watch for collapse toward 0 or 1.
         alpha  = torch.sigmoid(
-            self.gate(torch.cat([seq_pool, geom_pool], dim=-1))
+            self.gate(torch.cat([seq_pool_a, geom_pool_a], dim=-1))
         )                                            # (B, 1) or (B, d)
-        fused  = alpha * seq_pool + (1.0 - alpha) * geom_pool
+        fused  = alpha * seq_pool_a + (1.0 - alpha) * geom_pool_a
         fused  = self.drop(fused)
 
         # Optional library shift
