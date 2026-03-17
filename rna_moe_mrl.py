@@ -40,8 +40,8 @@ class RNAMoEMRLModel(nn.Module):
     Initialisation
     --------------
     gate_bias = 0.0  → mixture starts at α ≈ 0.5 (balanced)
-    gate_bias < 0    → starts trusting sequence branch more
-    gate_bias > 0    → starts trusting geometry branch more
+    gate_bias > 0    → starts trusting sequence branch more  (α → 1)
+    gate_bias < 0    → starts trusting geometry branch more  (α → 0)
 
     Freezing schedule
     -----------------
