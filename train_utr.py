@@ -1225,7 +1225,7 @@ def parse_args() -> TrainConfig:
                    help='[hybrid] Per-token structure bottleneck dimension')
     p.add_argument('--glob_bottleneck_dim',   type=int, default=128,
                    help='[hybrid] Global structure bottleneck dimension')
-    p.add_argument('--bottleneck_mode',  default='full', choices=['full', 'simple'],
+    p.add_argument('--bottleneck_mode',  default='v2', choices=['v2', 'v1', 'full', 'simple'],
                    help='[hybrid] Bottleneck variant: full=[H∥partner_ctx∥degree∥ss∥curv], '
                         'simple=[H∥partner_ctx∥curv] (cleaner ablation)')
     # Training
