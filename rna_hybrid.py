@@ -892,9 +892,10 @@ class RNAHybridModel(nn.Module):
         # Folding collate: edge_idx / edge_feat
         edge_idx:     Optional[torch.Tensor] = None,
         edge_feat:    Optional[torch.Tensor] = None,
-        # UTR collate: edge_index / edge_attrs (aliases)
+        # UTR collate: edge_index / edge_attrs / edge_mask (aliases; edge_mask unused)
         edge_index:   Optional[torch.Tensor] = None,
         edge_attrs:   Optional[torch.Tensor] = None,
+        edge_mask:    Optional[torch.Tensor] = None,
         labels:       Optional[torch.Tensor] = None,
         library_ids:  Optional[torch.Tensor] = None,
         # Auxiliary supervision targets
