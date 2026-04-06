@@ -531,6 +531,7 @@ def build_model(cfg: TrainConfig):
             lambda_pair   = cfg.lambda_pair,
             lambda_curv   = cfg.lambda_curv,
             lambda_cons   = cfg.lambda_cons,
+            max_len       = cfg.max_len or 4096,
         )
 
     # Default: original structure-edge Plücker model
