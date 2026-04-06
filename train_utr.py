@@ -160,6 +160,9 @@ class TrainConfig:
     # Eval-only mode (no training)
     eval_checkpoint: Optional[str] = None  # if set, load checkpoint and evaluate on --data; no training
 
+    # Bender positional encoding
+    pos_emb_type: str = 'sinusoidal'  # 'sinusoidal' | 'learned'
+
 
 def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
@@ -532,6 +535,7 @@ def build_model(cfg: TrainConfig):
             lambda_curv   = cfg.lambda_curv,
             lambda_cons   = cfg.lambda_cons,
             max_len       = cfg.max_len or 4096,
+            pos_emb_type  = cfg.pos_emb_type,
         )
 
     # Default: original structure-edge Plücker model
@@ -1277,6 +1281,9 @@ def parse_args() -> TrainConfig:
                    help='[bender] Pair-map (BPP supervision) loss weight')
     p.add_argument('--no_pair_head', action='store_true',
                    help='[bender] Disable the pair-map output head')
+    p.add_argument('--pos_emb_type', default='learned', choices=['sinusoidal', 'learned'],
+                   help='[bender] Positional encoding type: sinusoidal (no params, any length) '
+                        'or learned (fixed max_len, adds max_len×dim parameters)')
     # RNAstralign / folding
     p.add_argument('--data_format',  default='csv', choices=['csv', 'json', 'bpseq'],
                    help='[rnastralign] Input format: csv, json dict, or bpseq directory')
@@ -1404,6 +1411,7 @@ def parse_args() -> TrainConfig:
         resume_from          = args.resume_from,
         pretrained_backbone  = args.pretrained_backbone,
         eval_checkpoint      = args.eval_checkpoint,
+        pos_emb_type         = args.pos_emb_type,
         gate_type            = args.gate_type,
         gate_bias            = args.gate_bias,
         pretrained_geom_encoder = args.pretrained_geom_encoder,

@@ -70,6 +70,16 @@ SS_IGNORE_IDX = -100
 BACKBONE_OFFSETS = (1, 2, 4)  # Δ values for backbone local planes
 
 
+def _sinusoidal_pe(max_len: int, d_model: int) -> torch.Tensor:
+    """Return (max_len, d_model) sinusoidal positional encoding (no parameters)."""
+    pe  = torch.zeros(max_len, d_model)
+    pos = torch.arange(max_len).unsqueeze(1).float()
+    div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div[:d_model // 2])
+    return pe
+
+
 # ─── Plücker / wedge-product coordinate ───────────────────────────────────────
 
 def plucker_coords(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -479,6 +489,8 @@ class RNABenderModel(nn.Module):
         # curvature and consistency regularisers
         lambda_curv:   float = 0.01,
         lambda_cons:   float = 0.01,
+        # positional encoding type
+        pos_emb_type:  str   = 'sinusoidal',  # 'sinusoidal' | 'learned'
     ):
         super().__init__()
         if ff_dim is None:
@@ -489,6 +501,7 @@ class RNABenderModel(nn.Module):
         self.task          = task
         self.aux_struct    = aux_struct
         self.use_pair_head = use_pair_head
+        self.pos_emb_type  = pos_emb_type
 
         # Loss weights (stored as buffers so they move with .to(device))
         self.lambda_ss   = lambda_ss
@@ -499,7 +512,11 @@ class RNABenderModel(nn.Module):
 
         # ── Embeddings ──────────────────────────────────────────────────────
         self.token_emb = nn.Embedding(vocab_size, model_dim, padding_idx=PAD_ID)
-        self.pos_emb   = nn.Embedding(max_len,    model_dim)
+        if pos_emb_type == 'learned':
+            self.pos_emb = nn.Embedding(max_len, model_dim)
+        else:
+            # Sinusoidal: no parameters, works at any length
+            self.register_buffer('pos_enc', _sinusoidal_pe(max_len, model_dim), persistent=False)
 
         # ── Transformer blocks ──────────────────────────────────────────────
         self.blocks = nn.ModuleList([
@@ -597,8 +614,11 @@ class RNABenderModel(nn.Module):
             p_struct_list : list[Tensor(B,L,K,plu)]  per-layer structural Plücker
         """
         B, L = input_ids.shape
-        pos  = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        h    = self.drop(self.token_emb(input_ids) + self.pos_emb(pos))
+        if self.pos_emb_type == 'learned':
+            pos = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, -1)
+            h   = self.drop(self.token_emb(input_ids) + self.pos_emb(pos))
+        else:
+            h   = self.drop(self.token_emb(input_ids) + self.pos_enc[:L])
 
         p_bb1_list, kappa_list, p_struct_list = [], [], []
         for block in self.blocks:
