@@ -157,6 +157,9 @@ class TrainConfig:
     pretrained_backbone: Optional[str] = None  # path to pretrain checkpoint; if set,
                                                # encoder weights are loaded before training
 
+    # Eval-only mode (no training)
+    eval_checkpoint: Optional[str] = None  # if set, load checkpoint and evaluate on --data; no training
+
 
 def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
@@ -1019,7 +1022,90 @@ def _resume_ckpt(epoch, model, opt, sched, scaler,
     }
 
 
-# ─── Cross-validation orchestrator ─────────────��─────────────────────────────
+# ─── Eval-only mode ──────────────────────────────────────────────────────────
+
+def run_eval(cfg: TrainConfig):
+    """Load a saved checkpoint and evaluate on cfg.data. No training."""
+    device = torch.device(cfg.device)
+
+    print(f'Eval mode | checkpoint: {cfg.eval_checkpoint}')
+    print(f'Task: {cfg.task} | Data: {cfg.data} | Device: {cfg.device}')
+
+    # ── Detect checkpoint type and extract weights ────────────────────────────
+    ckpt = torch.load(cfg.eval_checkpoint, map_location='cpu', weights_only=False)
+    ckpt_keys = set(ckpt.keys())
+
+    if 'best_state' in ckpt_keys:
+        # Resume checkpoint (_resume.pt) — best_state = weights at best val epoch
+        raw_state = ckpt['best_state']
+        epoch_info = (f'best_state (best epoch {ckpt.get("best_epoch", "?")} '
+                      f'/ total {ckpt.get("epoch", "?")})')
+        stored_metrics = ckpt.get('best_metrics', {})
+    elif 'state_dict' in ckpt_keys:
+        # Best-model checkpoint (_best.pt)
+        raw_state = ckpt['state_dict']
+        epoch_info = f'state_dict (epoch {ckpt.get("best_epoch", "?")})'
+        stored_metrics = ckpt.get('metrics', {})
+        # Warn if stored cfg disagrees with CLI on model architecture
+        if 'cfg' in ckpt:
+            stored_cfg = ckpt['cfg']
+            mismatches = []
+            for attr in ('model_type', 'model_dim', 'num_layers', 'reduced_dim'):
+                sv = getattr(stored_cfg, attr, None)
+                cv = getattr(cfg, attr)
+                if sv is not None and sv != cv:
+                    mismatches.append(f'{attr}: ckpt={sv} CLI={cv}')
+            if mismatches:
+                print(f'  WARNING: model arch may differ from checkpoint: '
+                      + ', '.join(mismatches))
+    else:
+        raise ValueError(
+            f'Unrecognized checkpoint format. Keys found: {sorted(ckpt_keys)}\n'
+            f'Expected either a _resume.pt (has "best_state") or _best.pt (has "state_dict").'
+        )
+
+    print(f'  Weights: {epoch_info}')
+    if stored_metrics:
+        print('  Stored val metrics: '
+              + ' | '.join(f'{k}={v:.4f}' for k, v in stored_metrics.items()))
+
+    # ── Build model and load weights ──────────────────────────────────────────
+    model = build_model(cfg).to(device)
+    n_params = model.get_num_params()
+    model.load_state_dict({k: v.to(device) for k, v in raw_state.items()})
+    model.eval()
+    print(f'  Model: {cfg.model_type} | {n_params:,} params')
+
+    # ── Build eval dataset ────────────────────────────────────────────────────
+    dataset = build_dataset(cfg)
+    print(f'  Eval dataset: {len(dataset)} sequences')
+
+    if cfg.task == 'rnastralign':
+        task       = 'rnastralign'
+        collate_fn = collate_rnastralign
+    elif cfg.task == 'ires':
+        task       = 'classification'
+        collate_fn = collate_utr
+    else:
+        task       = 'regression'
+        collate_fn = collate_utr
+
+    loader = DataLoader(
+        dataset,
+        batch_size  = cfg.batch_size * 2,
+        shuffle     = False,
+        collate_fn  = collate_fn,
+        num_workers = cfg.num_workers,
+        pin_memory  = (device.type != 'cpu'),
+    )
+
+    metrics = evaluate(model, loader, device, task)
+    print('\n── Eval results ' + '─' * 40)
+    for k, v in metrics.items():
+        print(f'  {k:>20s}: {v:.4f}')
+
+
+# ─── Cross-validation orchestrator ───────────────────────────────────────────
 
 def run_cv(cfg: TrainConfig):
     """Full cross-validation run; prints aggregate statistics."""
@@ -1259,6 +1345,10 @@ def parse_args() -> TrainConfig:
                    help='Do not save checkpoints')
     p.add_argument('--resume_from',  default=None,
                    help='Path to a _resume.pt checkpoint to continue training')
+    p.add_argument('--eval_checkpoint', default=None,
+                   help='Path to a _resume.pt or _best.pt checkpoint. '
+                        'Evaluates on --data with no training and exits. '
+                        'Specify the same model arch flags used during training.')
     p.add_argument('--pretrained_backbone', default=None,
                    help='Path to a pretrain checkpoint (from pretrain_utr.py); '
                         'encoder weights are loaded before fine-tuning begins')
@@ -1312,6 +1402,7 @@ def parse_args() -> TrainConfig:
         test_data            = args.test_data,
         resume_from          = args.resume_from,
         pretrained_backbone  = args.pretrained_backbone,
+        eval_checkpoint      = args.eval_checkpoint,
         gate_type            = args.gate_type,
         gate_bias            = args.gate_bias,
         pretrained_geom_encoder = args.pretrained_geom_encoder,
@@ -1331,4 +1422,7 @@ def parse_args() -> TrainConfig:
 
 if __name__ == '__main__':
     cfg = parse_args()
-    run_cv(cfg)
+    if cfg.eval_checkpoint:
+        run_eval(cfg)
+    else:
+        run_cv(cfg)
