@@ -334,6 +334,18 @@ class GeoFoldNet(nn.Module):
         return F.avg_pool1d(H.permute(0, 2, 1), kernel_size=2, stride=2).permute(0, 2, 1)
 
     @staticmethod
+    def _align_mask(mask: Optional[torch.Tensor], target_L: int) -> Optional[torch.Tensor]:
+        """Crop or zero-pad a bool mask (B, L) to target_L."""
+        if mask is None:
+            return None
+        L = mask.shape[1]
+        if L == target_L:
+            return mask
+        if L > target_L:
+            return mask[:, :target_L]
+        return F.pad(mask.float(), (0, target_L - L)).bool()
+
+    @staticmethod
     def _align_H(H: torch.Tensor, target_L: int) -> torch.Tensor:
         L = H.shape[1]
         if L >= target_L:
@@ -393,8 +405,9 @@ class GeoFoldNet(nn.Module):
         for i in range(self.n_scales):
             Ls = F_cur.shape[-1]
             H_s = self._align_H(H_scales[i], Ls)
+            mask_s = self._align_mask(mask_scales[i], Ls)
             F_cur = self.enc_cnn[i](F_cur)
-            H_s = self.enc_seq[i](H_s, mask_scales[i])
+            H_s = self.enc_seq[i](H_s, mask_s)
             G_cur = self.enc_pair[i](G_cur, H_s)
             F_cur, G_cur = self.enc_fuse[i](F_cur, G_cur)
             F_skips.append(F_cur)
@@ -403,8 +416,9 @@ class GeoFoldNet(nn.Module):
             G_cur = self.g_pool[i](G_cur)
 
         # Bottleneck
-        H_bot = self._align_H(H_scales[-1], F_cur.shape[-1])
-        F_cur, G_cur, _ = self.bottleneck(F_cur, G_cur, H_bot, mask_scales[-1])
+        Lbot = F_cur.shape[-1]
+        H_bot = self._align_H(H_scales[-1], Lbot)
+        F_cur, G_cur, _ = self.bottleneck(F_cur, G_cur, H_bot, self._align_mask(mask_scales[-1], Lbot))
 
         # Decoder
         for i in range(self.n_scales):
