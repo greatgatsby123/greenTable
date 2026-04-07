@@ -49,6 +49,7 @@ from torch.utils.data import DataLoader, Subset
 
 from rna_structure_plucker import RNAStructureGrassmann
 from rna_bender import RNABenderModel, VOCAB_SIZE
+from rna_geo_fold import GeoFoldNet
 from rna_baseline import RNATransformerBaseline
 from rna_moe_mrl import RNAMoEMRLModel
 from rna_hybrid import RNAHybridModel
@@ -69,89 +70,89 @@ from utr_datasets import (
 @dataclass
 class TrainConfig:
     # Data
-    task:         str   = 'mrl'        # mrl | te | el | ires | rlu
-    data:         str   = ''           # path to CSV
-    bpp_backend:  str   = 'mfe'        # viennarna | mfe | zero
-    bpp_cache_dir:str   = '~/bpp_cache'
-    seq_col:      Optional[str] = None # None → auto from task (see _auto_fill)
-    label_col:    Optional[str] = None # None → auto from task
-    lib_col:      Optional[str] = None # column with library name (MRL)
-    cell_line:    Optional[str] = None # Muscle | PC3 | HEK (TE only)
-    max_len:      Optional[int] = None # None → auto from task
+    task: str = 'mrl'  # mrl | te | el | ires | rlu
+    data: str  = ''    # path to CSV
+    bpp_backend:  str= 'mfe'   # viennarna | mfe | zero
+    bpp_cache_dir:str  = '~/bpp_cache'
+    seq_col: Optional[str] = None # None → auto from task (see _auto_fill)
+    label_col: Optional[str] = None # None → auto from task
+    lib_col: Optional[str] = None # column with library name (MRL)
+    cell_line: Optional[str] = None # Muscle | PC3 | HEK (TE only)
+    max_len: Optional[int] = None # None → auto from task
 
     # Model
-    model_type:   str   = 'plucker'   # plucker | bender | transformer
-    model_dim:    int   = 128
-    num_layers:   int   = 4
-    num_heads:    int   = 8            # transformer baseline only
-    reduced_dim:  int   = 32
-    ff_dim:       Optional[int] = None # default: 4*model_dim
-    dropout:      float = 0.1
-    pooling:      str   = 'attention'
+    model_type: str = 'plucker'  # plucker | bender | transformer
+    model_dim: int = 128
+    num_layers: int = 4
+    num_heads: int = 8 # transformer baseline only
+    reduced_dim: int = 32
+    ff_dim: Optional[int] = None # default: 4*model_dim
+    dropout: float = 0.1
+    pooling: str = 'attention'
 
     # Auxiliary structure supervision (UTR-LM comparison mode)
     # When enabled, the model also predicts secondary structure (per-token)
     # and MFE (sequence-level) as auxiliary targets computed by ViennaRNA,
     # exactly mirroring what UTR-LM does during pretraining.
-    aux_struct:   bool  = False        # add SS + MFE auxiliary prediction heads
-    lambda_ss:    float = 0.1          # weight for per-token SS cross-entropy
-    lambda_mfe:   float = 0.01         # weight for scalar MFE regression
+    aux_struct: bool  = False    # add SS + MFE auxiliary prediction heads
+    lambda_ss: float = 0.1   # weight for per-token SS cross-entropy
+    lambda_mfe: float = 0.01       # weight for scalar MFE regression
 
     # RNA Bender geometric losses (active only when model_type='bender')
-    lambda_curv:  float = 0.01         # curvature regularisation weight
-    lambda_cons:  float = 0.0          # backbone–pairing consistency weight (disabled by default)
-    lambda_pair:  float = 0.1          # pair-map (BPP supervision) weight
+    lambda_curv:float = 0.01    # curvature regularisation weight
+    lambda_cons: float = 0.0   # backbone–pairing consistency weight (disabled by default)
+    lambda_pair: float = 0.1   # pair-map (BPP supervision) weight
     use_pair_head:bool  = True         # include pair-map head
 
     # MoE model (model_type='moe')
-    gate_type:           str           = 'scalar'  # 'scalar' | 'vector'
-    gate_bias:           float         = 0.0       # initial gate bias (0 = balanced)
+    gate_type: str  = 'scalar'  # 'scalar' | 'vector'
+    gate_bias: float  = 0.0       # initial gate bias (0 = balanced)
     pretrained_geom_encoder: Optional[str] = None  # path to geom encoder checkpoint
-    freeze_geom_epochs:  int           = 0         # freeze geom branch for N epochs
-    geom_lr_scale:       float         = 0.1       # LR multiplier for geom encoder
-    geom_num_layers:     int           = 4         # geometry branch depth (can differ from seq)
+    freeze_geom_epochs:  int  = 0         # freeze geom branch for N epochs
+    geom_lr_scale: float = 0.1       # LR multiplier for geom encoder
+    geom_num_layers:  int   = 4         # geometry branch depth (can differ from seq)
 
     # Hybrid model (model_type='hybrid')
-    seq_dim:               int         = 128       # Stage B sequence encoder hidden dim
-    seq_num_layers_hybrid: int         = 2         # Stage B sequence encoder depth
-    struct_bottleneck_dim: int         = 64        # per-token structure bottleneck dim
-    glob_bottleneck_dim:   int         = 128       # global structure bottleneck dim
-    bottleneck_mode:       str         = 'full'    # 'full' | 'simple' (ablation)
+    seq_dim:  int= 128       # Stage B sequence encoder hidden dim
+    seq_num_layers_hybrid: int   = 2         # Stage B sequence encoder depth
+    struct_bottleneck_dim: int = 64   # per-token structure bottleneck dim
+    glob_bottleneck_dim:   int   = 128       # global structure bottleneck dim
+    bottleneck_mode:  str = 'full'    # 'full' | 'simple' (ablation)
 
     # RNAstralign / folding task
-    data_format:  str   = 'csv'        # 'csv' or 'bpseq' (rnastralign task only)
-    struct_col:   Optional[str] = None # dot-bracket column name (csv format)
-    family_col:   Optional[str] = None # family column name (csv format)
-    family_split: bool  = True         # use family-aware GroupKFold (rnastralign)
+    data_format: str  = 'csv'        # 'csv' or 'bpseq' (rnastralign task only)
+    struct_col: Optional[str] = None # dot-bracket column name (csv format)
+    family_col:  Optional[str] = None # family column name (csv format)
+    family_split: bool = True         # use family-aware GroupKFold (rnastralign)
     oracle_edges: bool  = True         # include ground-truth base pairs as graph edges
 
     # Training
-    epochs:       int   = 60
-    batch_size:   int   = 64
-    lr:           float = 3e-4
+    epochs: int   = 60
+    batch_size: int   = 64
+    lr:  float = 3e-4
     weight_decay: float = 1e-2
-    clip_grad:    float = 1.0
-    patience:     int   = 10          # early stopping on primary metric
+    clip_grad: float = 1.0
+    patience: int  = 10   # early stopping on primary metric
     warmup_steps: int   = 200
 
     # Evaluation
-    folds:        int   = 1           # 1 = single train/val split (80/20)
-    val_frac:     float = 0.2         # used only when folds == 1
-    stratify:     bool  = True        # stratified fold split for regression
-    seed:         int   = 42
-    split_file:   Optional[str] = None  # path to save/load split indices (JSON)
+    folds: int   = 1   # 1 = single train/val split (80/20)
+    val_frac: float = 0.2  # used only when folds == 1
+    stratify: bool  = True  # stratified fold split for regression
+    seed: int  = 42
+    split_file: Optional[str] = None  # path to save/load split indices (JSON)
 
     # Speed / precision
-    use_amp:      bool  = True         # mixed-precision (CUDA only; auto-disabled on CPU)
-    eval_every:   int   = 5            # evaluate val set every N epochs (saves time on large data)
+    use_amp: bool  = True  # mixed-precision (CUDA only; auto-disabled on CPU)
+    eval_every: int   = 5            # evaluate val set every N epochs (saves time on large data)
 
     # Runtime
-    device:       str   = 'auto'
-    num_workers:  int   = 2
-    output_dir:   str   = 'outputs'
-    save_best:    bool  = True
-    test_data:    Optional[str] = None  # if set, use as fixed hold-out instead of CV
-    resume_from:  Optional[str] = None  # path to a resume checkpoint to continue training
+    device: str = 'auto'
+    num_workers: int  = 2
+    output_dir: str = 'outputs'
+    save_best: bool = True
+    test_data: Optional[str] = None  # if set, use as fixed hold-out instead of CV
+    resume_from: Optional[str] = None  # path to a resume checkpoint to continue training
 
     # Pretrain-then-finetune
     pretrained_backbone: Optional[str] = None  # path to pretrain checkpoint; if set,
@@ -168,7 +169,7 @@ def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
     if cfg.task == 'rnastralign':
         # Folding task: column defaults differ from UTR tasks
-        if cfg.seq_col    is None: cfg.seq_col    = 'sequence'
+        if cfg.seq_col is None: cfg.seq_col = 'sequence'
         if cfg.struct_col is None: cfg.struct_col = 'structure'
         if cfg.family_col is None: cfg.family_col = 'family'
         if cfg.device == 'auto':
@@ -177,17 +178,17 @@ def _auto_fill(cfg: TrainConfig) -> TrainConfig:
 
     task_defaults = {
         # Column names match capsule-4214075-data files exactly
-        'mrl':  dict(label_col='rl',                      seq_col='utr',                     max_len=50),
-        'te':   dict(label_col='te_log',                  seq_col='utr',                     max_len=100),
-        'el':   dict(label_col='rnaseq_log',              seq_col='utr',                     max_len=100),
-        'ires': dict(label_col='label',                   seq_col='sequence',                max_len=None),
-        'rlu':  dict(label_col='label',                   seq_col='utr_originial_varylength', max_len=50),
+        'mrl': dict(label_col='rl',  seq_col='utr',   max_len=50),
+        'te': dict(label_col='te_log',  seq_col='utr', max_len=100),
+        'el': dict(label_col='rnaseq_log',seq_col='utr',  max_len=100),
+        'ires': dict(label_col='label', seq_col='sequence', max_len=None),
+        'rlu': dict(label_col='label',  seq_col='utr_originial_varylength', max_len=50),
     }
     d = task_defaults[cfg.task]
     # Only fill fields the user did not explicitly set (sentinel = None).
-    if cfg.seq_col   is None: cfg.seq_col   = d['seq_col']
+    if cfg.seq_col is None: cfg.seq_col = d['seq_col']
     if cfg.label_col is None: cfg.label_col = d['label_col']
-    if cfg.max_len   is None: cfg.max_len   = d['max_len']   # stays None for mrl/ires/rlu
+    if cfg.max_len is None: cfg.max_len = d['max_len']   # stays None for mrl/ires/rlu
     if cfg.device == 'auto':
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     return cfg
@@ -200,12 +201,12 @@ def build_dataset(cfg: TrainConfig):
     if cfg.task == 'rnastralign':
         return RNAstralignDataset(
             cfg.data,
-            data_format             = cfg.data_format,
-            seq_col                 = cfg.seq_col    or 'sequence',
-            struct_col              = cfg.struct_col or 'structure',
-            family_col              = cfg.family_col or 'family',
-            max_len                 = cfg.max_len,
-            top_k_struct            = 4,
+            data_format  = cfg.data_format,
+            seq_col = cfg.seq_col    or 'sequence',
+            struct_col = cfg.struct_col or 'structure',
+            family_col = cfg.family_col or 'family',
+            max_len = cfg.max_len,
+            top_k_struct = 4,
             use_oracle_struct_edges = cfg.oracle_edges,
         )
 
@@ -265,7 +266,7 @@ def check_pretrain_arch(ckpt_path: str, cfg: 'TrainConfig'):
     Checks model_dim, num_layers, reduced_dim.  If the checkpoint does not
     contain a saved config (old format) the check is skipped with a warning.
     """
-    ckpt       = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     saved_cfg  = ckpt.get('cfg')
     if saved_cfg is None:
         import warnings
@@ -320,8 +321,8 @@ def load_pretrained_encoder(model: 'RNAStructureGrassmann', ckpt_path: str) -> i
 
     model.load_state_dict(to_load, strict=False)
     n_loaded  = sum(v.numel() for v in to_load.values())
-    n_model   = sum(v.numel() for v in model_sd.values())
-    frac      = n_loaded / max(n_model, 1)
+    n_model  = sum(v.numel() for v in model_sd.values())
+    frac = n_loaded / max(n_model, 1)
     if skipped:
         print(f'  Pretrain load: skipped {len(skipped)} keys '
               f'(shape mismatch or not in fine-tune model)')
@@ -399,15 +400,15 @@ def build_model(cfg: TrainConfig):
         tf_task    = 'folding' if is_folding else task_type
         aux_struct = True      if is_folding else cfg.aux_struct
         return RNATransformerBaseline(
-            model_dim     = cfg.model_dim,
-            num_layers    = cfg.num_layers,
-            num_heads     = cfg.num_heads,
-            ff_dim        = cfg.ff_dim,
-            dropout       = cfg.dropout,
-            pooling       = cfg.pooling,
-            task          = tf_task,
+            model_dim = cfg.model_dim,
+            num_layers = cfg.num_layers,
+            num_heads = cfg.num_heads,
+            ff_dim = cfg.ff_dim,
+            dropout = cfg.dropout,
+            pooling = cfg.pooling,
+            task = tf_task,
             num_libraries = num_libraries,
-            aux_struct    = aux_struct,
+            aux_struct = aux_struct,
             use_pair_head = cfg.use_pair_head,
         )
 
@@ -435,19 +436,19 @@ def build_model(cfg: TrainConfig):
             _check_pretrained_geom_arch(cfg)
 
         model = RNAMoEMRLModel(
-            model_dim        = cfg.model_dim,
-            seq_num_layers   = cfg.num_layers,
-            seq_num_heads    = cfg.num_heads,
-            geom_num_layers  = geom_layers,
+            model_dim = cfg.model_dim,
+            seq_num_layers = cfg.num_layers,
+            seq_num_heads = cfg.num_heads,
+            geom_num_layers = geom_layers,
             geom_reduced_dim = geom_r,
-            geom_max_len     = geom_max_len,
-            vocab_size       = VOCAB_SIZE,
-            max_len          = cfg.max_len or 256,
-            dropout          = cfg.dropout,
-            pooling          = cfg.pooling,
-            num_libraries    = num_libraries,
-            gate_type        = cfg.gate_type,
-            gate_bias        = cfg.gate_bias,
+            geom_max_len = geom_max_len,
+            vocab_size = VOCAB_SIZE,
+            max_len = cfg.max_len or 256,
+            dropout = cfg.dropout,
+            pooling = cfg.pooling,
+            num_libraries = num_libraries,
+            gate_type = cfg.gate_type,
+            gate_bias = cfg.gate_bias,
         )
         if cfg.pretrained_geom_encoder:
             model.load_pretrained_geom(cfg.pretrained_geom_encoder)
@@ -457,10 +458,10 @@ def build_model(cfg: TrainConfig):
         # Two-stage hybrid: Stage A = geometry encoder + structure bottleneck,
         # Stage B = small sequence encoder + cross-attention bridge from structure.
         # Same auto-read-arch-from-checkpoint logic as 'moe'.
-        geom_layers  = cfg.geom_num_layers
-        geom_r       = cfg.reduced_dim
+        geom_layers = cfg.geom_num_layers
+        geom_r = cfg.reduced_dim
         geom_max_len = None
-        geom_dim     = cfg.model_dim   # may be overridden from checkpoint below
+        geom_dim = cfg.model_dim   # may be overridden from checkpoint below
 
         if cfg.pretrained_geom_encoder:
             try:
@@ -485,32 +486,41 @@ def build_model(cfg: TrainConfig):
             _check_pretrained_geom_arch(cfg)
 
         model = RNAHybridModel(
-            vocab_size            = VOCAB_SIZE,
-            max_len               = cfg.max_len or 256,
-            geom_dim              = geom_dim,
-            geom_num_layers       = geom_layers,
-            geom_reduced_dim      = geom_r,
-            geom_ff_dim           = cfg.ff_dim,
-            geom_max_len          = geom_max_len,
+            vocab_size = VOCAB_SIZE,
+            max_len = cfg.max_len or 256,
+            geom_dim = geom_dim,
+            geom_num_layers = geom_layers,
+            geom_reduced_dim = geom_r,
+            geom_ff_dim = cfg.ff_dim,
+            geom_max_len = geom_max_len,
             struct_bottleneck_dim = cfg.struct_bottleneck_dim,
-            glob_bottleneck_dim   = cfg.glob_bottleneck_dim,
-            seq_dim               = cfg.seq_dim,
-            seq_num_layers        = cfg.seq_num_layers_hybrid,
-            seq_num_heads         = cfg.num_heads,
-            seq_ff_dim            = cfg.ff_dim,
-            dropout               = cfg.dropout,
-            pooling               = cfg.pooling,
-            num_libraries         = num_libraries,
-            lambda_pair           = cfg.lambda_pair,
-            lambda_ss             = cfg.lambda_ss,
-            lambda_mfe            = cfg.lambda_mfe,
-            lambda_curv           = cfg.lambda_curv,
-            lambda_cons           = cfg.lambda_cons,
-            bottleneck_mode       = cfg.bottleneck_mode,
+            glob_bottleneck_dim = cfg.glob_bottleneck_dim,
+            seq_dim  = cfg.seq_dim,
+            seq_num_layers = cfg.seq_num_layers_hybrid,
+            seq_num_heads= cfg.num_heads,
+            seq_ff_dim = cfg.ff_dim,
+            dropout= cfg.dropout,
+            pooling = cfg.pooling,
+            num_libraries = num_libraries,
+            lambda_pair = cfg.lambda_pair,
+            lambda_ss = cfg.lambda_ss,
+            lambda_mfe= cfg.lambda_mfe,
+            lambda_curv = cfg.lambda_curv,
+            lambda_cons = cfg.lambda_cons,
+            bottleneck_mode = cfg.bottleneck_mode,
         )
         if cfg.pretrained_geom_encoder:
             model.load_pretrained_geom(cfg.pretrained_geom_encoder)
         return model
+
+    if cfg.model_type == 'geofold':
+        return GeoFoldNet(
+            node_dim     = cfg.model_dim,
+            pair_dim     = cfg.reduced_dim,
+            n_scales     = cfg.num_layers,
+            max_pos      = cfg.max_len or 4096,
+            dropout      = cfg.dropout,
+        )
 
     if cfg.model_type == 'bender':
         # For the folding task:
@@ -519,23 +529,23 @@ def build_model(cfg: TrainConfig):
         bender_task = 'folding' if is_folding else task_type
         aux_struct  = True      if is_folding else cfg.aux_struct
         return RNABenderModel(
-            model_dim     = cfg.model_dim,
-            num_layers    = cfg.num_layers,
-            reduced_dim   = cfg.reduced_dim,
-            ff_dim        = cfg.ff_dim,
-            dropout       = cfg.dropout,
-            pooling       = cfg.pooling,
-            task          = bender_task,
+            model_dim = cfg.model_dim,
+            num_layers= cfg.num_layers,
+            reduced_dim  = cfg.reduced_dim,
+            ff_dim = cfg.ff_dim,
+            dropout  = cfg.dropout,
+            pooling = cfg.pooling,
+            task = bender_task,
             num_libraries = num_libraries,
-            aux_struct    = aux_struct,
-            lambda_ss     = cfg.lambda_ss,
-            lambda_mfe    = cfg.lambda_mfe,
+            aux_struct = aux_struct,
+            lambda_ss= cfg.lambda_ss,
+            lambda_mfe = cfg.lambda_mfe,
             use_pair_head = cfg.use_pair_head,
-            lambda_pair   = cfg.lambda_pair,
-            lambda_curv   = cfg.lambda_curv,
-            lambda_cons   = cfg.lambda_cons,
-            max_len       = cfg.max_len or 4096,
-            pos_emb_type  = cfg.pos_emb_type,
+            lambda_pair = cfg.lambda_pair,
+            lambda_curv = cfg.lambda_curv,
+            lambda_cons= cfg.lambda_cons,
+            max_len = cfg.max_len or 4096,
+            pos_emb_type = cfg.pos_emb_type,
         )
 
     # Default: original structure-edge Plücker model
@@ -575,8 +585,8 @@ def train_epoch(
     optimiser: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     device: torch.device,
-    clip_grad:        float = 1.0,
-    scaler:           Optional['torch.cuda.amp.GradScaler'] = None,
+    clip_grad: float = 1.0,
+    scaler: Optional['torch.cuda.amp.GradScaler'] = None,
     compute_loss_fn   = None,   # callable(outputs_dict, batch) -> Tensor
                                 # if None, falls back to old (logits, loss) API
 ) -> float:
@@ -650,9 +660,9 @@ def train_epoch(
 @torch.no_grad()
 def evaluate(
     model,
-    loader:    DataLoader,
-    device:    torch.device,
-    task:      str = 'regression',   # 'regression' | 'classification' | 'rnastralign'
+    loader: DataLoader,
+    device:torch.device,
+    task: str = 'regression',   # 'regression' | 'classification' | 'rnastralign'
 ) -> Dict[str, float]:
     model.eval()
 
@@ -1259,7 +1269,7 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid', 'fcgrcnn'],
+                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid', 'fcgrcnn', 'geofold'],
                    help='plucker  = original StructureEdgePlucker; '
                         'bender = RNA Bender with Grassmann curvature; '
                         'transformer  = standard MHA baseline (sequence-only); '

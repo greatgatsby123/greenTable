@@ -62,12 +62,12 @@ NUC_VOCAB: Dict[str, int] = {
     '<PAD>': 5,
 }
 VOCAB_SIZE  = 6
-PAD_ID      = NUC_VOCAB['<PAD>']
-MASK_ID     = NUC_VOCAB['N']   # used as MASK token in MLM pre-training
-N_EDGE_FEATS = 3               # [bp_prob, norm_dist, is_struct_edge]
+PAD_ID  = NUC_VOCAB['<PAD>']
+MASK_ID   = NUC_VOCAB['N']   
+N_EDGE_FEATS = 3       
 SS_IGNORE_IDX = -100
 
-BACKBONE_OFFSETS = (1, 2, 4)  # Δ values for backbone local planes
+BACKBONE_OFFSETS = (1, 2, 4) 
 
 
 def _sinusoidal_pe(max_len: int, d_model: int) -> torch.Tensor:
@@ -97,7 +97,7 @@ def plucker_coords(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     # Outer products
     uu = u.unsqueeze(-1)   # (..., r, 1)
     vv = v.unsqueeze(-2)   # (..., 1, r)
-    outer = uu * vv        # (..., r, r)  :  outer[...,a,b] = u_a * v_b
+    outer = uu * vv    # (..., r, r)  :  outer[...,a,b] = u_a * v_b
     # Anti-symmetrise and extract upper triangle (a < b)
     anti = outer - outer.transpose(-1, -2)   # (..., r, r)
     idx  = torch.triu_indices(r, r, offset=1, device=u.device)
@@ -142,14 +142,14 @@ class BackboneCurvatureMixer(nn.Module):
         # Step B
         self.W_red = nn.Linear(model_dim, reduced_dim, bias=True)
 
-        # Step D — backbone channel  (concat of all offsets → model_dim)
+        # Step D backbone channel  (concat of all offsets → model_dim)
         self.phi_bb = nn.Sequential(
             nn.Linear(len(offsets) * plu_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, model_dim),
         )
 
-        # Step D — curvature channel
+        # Step D curvature channel
         self.phi_curv = nn.Sequential(
             nn.Linear(plu_dim, hidden),
             nn.GELU(),
@@ -158,8 +158,8 @@ class BackboneCurvatureMixer(nn.Module):
 
     def forward(
         self,
-        h:        torch.Tensor,   # (B, L, d)
-        seq_mask: torch.Tensor,   # (B, L) bool  True = valid
+        h: torch.Tensor, 
+        seq_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -227,8 +227,8 @@ class StructuralEdgeMixer(nn.Module):
 
     def __init__(
         self,
-        reduced_dim:   int,
-        model_dim:     int,
+        reduced_dim: int,
+        model_dim: int,
         edge_feat_dim: int = N_EDGE_FEATS,
     ):
         super().__init__()
@@ -246,9 +246,9 @@ class StructuralEdgeMixer(nn.Module):
 
     def forward(
         self,
-        z:         torch.Tensor,   # (B, L, r)
-        h:         torch.Tensor,   # (B, L, d)  — hidden state for attention query
-        edge_idx:  torch.Tensor,   # (B, L, K)  int64; -1 = padding
+        z: torch.Tensor,   # (B, L, r)
+        h: torch.Tensor,   # (B, L, d)  — hidden state for attention query
+        edge_idx: torch.Tensor,   # (B, L, K)  int64; -1 = padding
         edge_feat: torch.Tensor,   # (B, L, K, E)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -304,11 +304,11 @@ class RNABenderLayer(nn.Module):
 
     def __init__(
         self,
-        model_dim:    int,
-        reduced_dim:  int,
-        ff_dim:       int,
-        dropout:      float = 0.1,
-        offsets:      Tuple[int, ...] = BACKBONE_OFFSETS,
+        model_dim: int,
+        reduced_dim: int,
+        ff_dim: int,
+        dropout: float = 0.1,
+        offsets: Tuple[int, ...] = BACKBONE_OFFSETS,
     ):
         super().__init__()
         d = model_dim
@@ -343,7 +343,7 @@ class RNABenderLayer(nn.Module):
 
     def forward(
         self,
-        h:         torch.Tensor,   # (B, L, d)
+        h: torch.Tensor,   # (B, L, d)
         edge_idx:  torch.Tensor,   # (B, L, K)
         edge_feat: torch.Tensor,   # (B, L, K, 3)
         seq_mask:  torch.Tensor,   # (B, L)
@@ -398,7 +398,7 @@ class PairMapHead(nn.Module):
 
     def forward(
         self,
-        h:        torch.Tensor,   # (B, L, d)
+        h: torch.Tensor,   # (B, L, d)
         seq_mask: torch.Tensor,   # (B, L)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -434,8 +434,8 @@ class GlobalGrassmannStats(nn.Module):
 
     def compute(
         self,
-        p_bb1:    torch.Tensor,   # (B, L, plu_dim)
-        kappa:    torch.Tensor,   # (B, L, plu_dim)
+        p_bb1: torch.Tensor,   # (B, L, plu_dim)
+        kappa: torch.Tensor,   # (B, L, plu_dim)
         seq_mask: torch.Tensor,   # (B, L)
     ) -> torch.Tensor:
         """Returns: (B, plu_dim + 2)"""
@@ -468,27 +468,27 @@ class RNABenderModel(nn.Module):
 
     def __init__(
         self,
-        vocab_size:    int   = VOCAB_SIZE,
-        max_len:       int   = 256,
-        model_dim:     int   = 128,
-        num_layers:    int   = 4,
-        reduced_dim:   int   = 16,
-        ff_dim:        Optional[int] = None,
-        dropout:       float = 0.1,
-        pooling:       str   = 'attention',   # 'attention' | 'mean'
-        task:          str   = 'regression',  # 'regression' | 'classification' | 'folding'
+        vocab_size: int   = VOCAB_SIZE,
+        max_len:int   = 256,
+        model_dim: int   = 128,
+        num_layers: int   = 4,
+        reduced_dim: int   = 16,
+        ff_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        pooling: str   = 'attention',   # 'attention' | 'mean'
+        task:   str   = 'regression',  # 'regression' | 'classification' | 'folding'
         num_libraries: int   = 0,
-        offsets:       Tuple[int, ...] = BACKBONE_OFFSETS,
+        offsets: Tuple[int, ...] = BACKBONE_OFFSETS,
         # auxiliary structure heads (UTR-LM comparison)
-        aux_struct:    bool  = False,
-        lambda_ss:     float = 0.1,
-        lambda_mfe:    float = 0.01,
+        aux_struct:bool  = False,
+        lambda_ss:  float = 0.1,
+        lambda_mfe: float = 0.01,
         # geometric heads
-        use_pair_head: bool  = True,
+        use_pair_head:bool  = True,
         lambda_pair:   float = 0.1,
         # curvature and consistency regularisers
-        lambda_curv:   float = 0.01,
-        lambda_cons:   float = 0.01,
+        lambda_curv: float = 0.01,
+        lambda_cons: float = 0.01,
         # positional encoding type
         pos_emb_type:  str   = 'sinusoidal',  # 'sinusoidal' | 'learned'
     ):
@@ -496,15 +496,15 @@ class RNABenderModel(nn.Module):
         if ff_dim is None:
             ff_dim = 4 * model_dim
 
-        self.model_dim     = model_dim
-        self.reduced_dim   = reduced_dim
-        self.task          = task
-        self.aux_struct    = aux_struct
+        self.model_dim = model_dim
+        self.reduced_dim  = reduced_dim
+        self.task  = task
+        self.aux_struct  = aux_struct
         self.use_pair_head = use_pair_head
         self.pos_emb_type  = pos_emb_type
 
         # Loss weights (stored as buffers so they move with .to(device))
-        self.lambda_ss   = lambda_ss
+        self.lambda_ss = lambda_ss
         self.lambda_mfe  = lambda_mfe
         self.lambda_pair = lambda_pair
         self.lambda_curv = lambda_curv
@@ -600,9 +600,9 @@ class RNABenderModel(nn.Module):
     def encode(
         self,
         input_ids: torch.Tensor,   # (B, L)
-        edge_idx:  torch.Tensor,   # (B, L, K)
+        edge_idx: torch.Tensor,   # (B, L, K)
         edge_feat: torch.Tensor,   # (B, L, K, 3)
-        seq_mask:  torch.Tensor,   # (B, L)
+        seq_mask: torch.Tensor,   # (B, L)
     ) -> Tuple[torch.Tensor, List, List, List]:
         """
         Run all transformer blocks.
@@ -634,20 +634,20 @@ class RNABenderModel(nn.Module):
 
     def _compute_loss(
         self,
-        logits:        torch.Tensor,
-        labels:        torch.Tensor,
-        seq_mask:      torch.Tensor,
-        kappa_list:    List[torch.Tensor],
-        p_bb1_list:    List[torch.Tensor],
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        seq_mask: torch.Tensor,
+        kappa_list: List[torch.Tensor],
+        p_bb1_list: List[torch.Tensor],
         p_struct_list: List[torch.Tensor],
-        edge_idx:      torch.Tensor,
-        edge_feat:     torch.Tensor,
-        pair_logits:   Optional[torch.Tensor],
-        pair_mask:     Optional[torch.Tensor],
-        ss_logits:     Optional[torch.Tensor],
-        mfe_pred:      Optional[torch.Tensor],
-        ss_labels:     Optional[torch.Tensor],
-        mfe_labels:    Optional[torch.Tensor],
+        edge_idx: torch.Tensor,
+        edge_feat: torch.Tensor,
+        pair_logits: Optional[torch.Tensor],
+        pair_mask: Optional[torch.Tensor],
+        ss_logits: Optional[torch.Tensor],
+        mfe_pred: Optional[torch.Tensor],
+        ss_labels: Optional[torch.Tensor],
+        mfe_labels: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Return the total scalar loss."""
 
@@ -720,19 +720,19 @@ class RNABenderModel(nn.Module):
 
     def forward(
         self,
-        input_ids:   torch.Tensor,
-        seq_mask:    torch.Tensor,
+        input_ids:torch.Tensor,
+        seq_mask: torch.Tensor,
         # Primary edge inputs (rnastralign / folding collate names)
-        edge_idx:    Optional[torch.Tensor] = None,
-        edge_feat:   Optional[torch.Tensor] = None,
+        edge_idx: Optional[torch.Tensor] = None,
+        edge_feat: Optional[torch.Tensor] = None,
         # Alias names used by UTR collate (collate_rna) — mapped to edge_idx/edge_feat
-        edge_index:  Optional[torch.Tensor] = None,
-        edge_attrs:  Optional[torch.Tensor] = None,
-        edge_mask:   Optional[torch.Tensor] = None,   # accepted but not used
-        # Task labels
-        labels:      Optional[torch.Tensor] = None,
+        edge_index:Optional[torch.Tensor] = None,
+        edge_attrs: Optional[torch.Tensor] = None,
+        edge_mask: Optional[torch.Tensor] = None,   # accepted but not used
+        # Task labless
+        labels: Optional[torch.Tensor] = None,
         library_ids: Optional[torch.Tensor] = None,
-        ss_labels:   Optional[torch.Tensor] = None,
+        ss_labels:  Optional[torch.Tensor] = None,
         mfe_labels:  Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -810,7 +810,7 @@ class RNABenderModel(nn.Module):
 
 def _edge_feat_to_dense_bpp(
     edge_feat: torch.Tensor,   # (B, L, K, 3)  — channel 0 is bp_prob
-    edge_idx:  torch.Tensor,   # (B, L, K)     — neighbour indices, -1 = pad
+    edge_idx: torch.Tensor,   # (B, L, K)     — neighbour indices, -1 = pad
     L:         int,
 ) -> torch.Tensor:
     """
@@ -841,7 +841,7 @@ def _edge_feat_to_dense_bpp(
 
 
 def _consistency_loss(
-    p_bb1:    torch.Tensor,   # (B, L, plu_dim)  backbone offset-1 Plücker
+    p_bb1:torch.Tensor,   # (B, L, plu_dim)  backbone offset-1 Plücker
     p_struct: torch.Tensor,   # (B, L, K, plu_dim)  structural edge Plücker
     edge_feat: torch.Tensor,  # (B, L, K, 3)
 ) -> torch.Tensor:
