@@ -855,20 +855,39 @@ class RNABenderEnergyModel(nn.Module):
 
     def forward(
         self,
-        input_ids:   torch.Tensor,            # (B, L)
-        seq_mask:    torch.Tensor,            # (B, L) bool
-        pair_labels: Optional[torch.Tensor] = None,  # (B, L) int64, -1=unpaired
+        input_ids:    torch.Tensor,                   # (B, L)
+        seq_mask:     torch.Tensor,                   # (B, L) bool
+        pair_targets: Optional[torch.Tensor] = None,  # (B, L, L) float — from collate_rnastralign
+        pair_labels:  Optional[torch.Tensor] = None,  # (B, L) int64 — direct label override
+        **kwargs,                                     # absorb edge_idx / edge_feat / ss_labels
     ) -> Dict[str, torch.Tensor]:
         """
+        Compatible with the GeoFoldNet / RNABenderModel interface used by train_utr.py.
+
+        Accepts pair_targets (B, L, L) from collate_rnastralign and converts them
+        to pair_labels (B, L) internally.  Also accepts pair_labels directly.
+        Extra kwargs (edge_idx, edge_feat, ss_labels, families, …) are silently ignored
+        — this model derives all structure from sequence alone.
+
         Returns a dict with:
+            pair_logits     : (B, L, L)  pseudo-logits from pred_pairs (+10/-10)
+                              compatible with folding_loss / _evaluate_structure
+            kappa_list      : list[(B, L, plu_dim)]  for curvature regularisation
             local_energy    : (B, L)
             unpaired_energy : (B, L)
             pair_energy     : (B, L, L)  with +1e9 for forbidden pairs
             pred_pairs      : (B, L) int64  decoded structure
             total_energy    : (B,)  E(x, S_pred)
-            kappa_list      : list[(B, L, plu_dim)]
-            loss            : scalar, present when pair_labels is not None
+            loss            : scalar, present when pair_targets or pair_labels given
         """
+        # Derive pair_labels from pair_targets if not given directly
+        if pair_labels is None and pair_targets is not None:
+            partners  = pair_targets.argmax(dim=-1).long()
+            is_paired = (pair_targets.max(dim=-1).values > 0.5)
+            pair_labels = torch.where(
+                is_paired, partners, torch.full_like(partners, -1)
+            )
+
         h, z, p_bb1, kappa, kappa_list = self.encode(input_ids, seq_mask)
 
         # Geometric context from sequence only
@@ -878,31 +897,46 @@ class RNABenderEnergyModel(nn.Module):
         )
 
         # Energy tables
-        e_local = self.local_head(h, z, p_bb1, kappa)            # (B, L)
-        e_unp   = self.unpaired_head(h, z, p_bb1)                # (B, L)
-        e_pair  = self.pair_head(h, z, p_bb1, seq_mask, canon_mask)  # (B, L, L)
+        e_local = self.local_head(h, z, p_bb1, kappa)                  # (B, L)
+        e_unp   = self.unpaired_head(h, z, p_bb1)                      # (B, L)
+        e_pair  = self.pair_head(h, z, p_bb1, seq_mask, canon_mask)    # (B, L, L)
         e_pair  = e_pair.masked_fill(~phys_mask, 1e9)
 
         # Decode optimal structure (non-differentiable argmin)
-        pred_pairs  = self.decoder(e_pair, e_unp, phys_mask)     # (B, L)
+        pred_pairs = self.decoder(e_pair, e_unp, phys_mask)            # (B, L)
 
         # Energy of decoded structure (differentiable)
         total_energy = _energy_of_structure(
             e_local, e_unp, e_pair, pred_pairs, seq_mask
         )
 
+        # Build pair_logits from pred_pairs: +10 where paired, -10 elsewhere.
+        # This makes the output compatible with folding_loss (BCE) and
+        # _evaluate_structure (sigmoid threshold) without any changes there.
+        B, L = pred_pairs.shape
+        pair_logits = torch.full((B, L, L), -10.0,
+                                 device=input_ids.device, dtype=e_pair.dtype)
+        b_idx = torch.arange(B, device=input_ids.device).unsqueeze(1).expand(B, L)
+        i_idx = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, L)
+        clamped = pred_pairs.clamp(min=0)
+        is_pair = (pred_pairs >= 0)
+        pair_logits[b_idx[is_pair], i_idx[is_pair], clamped[is_pair]] = 10.0
+        pair_logits[b_idx[is_pair], clamped[is_pair], i_idx[is_pair]] = 10.0
+
         out: Dict[str, object] = {
+            'pair_logits':     pair_logits,
+            'kappa_list':      kappa_list,
             'local_energy':    e_local,
             'unpaired_energy': e_unp,
             'pair_energy':     e_pair,
             'pred_pairs':      pred_pairs,
             'total_energy':    total_energy,
-            'kappa_list':      kappa_list,
         }
 
         if pair_labels is not None:
             out['loss'] = self._compute_loss(
-                e_local, e_unp, e_pair, pair_labels, pred_pairs, phys_mask, kappa_list, seq_mask
+                e_local, e_unp, e_pair, pair_labels, pred_pairs,
+                phys_mask, kappa_list, seq_mask,
             )
 
         return out

@@ -49,6 +49,7 @@ from torch.utils.data import DataLoader, Subset
 
 from rna_structure_plucker import RNAStructureGrassmann
 from rna_bender import RNABenderModel, VOCAB_SIZE
+from rna_bender_energy import RNABenderEnergyModel
 from rna_geo_fold import GeoFoldNet
 from rna_baseline import RNATransformerBaseline
 from rna_moe_mrl import RNAMoEMRLModel
@@ -81,7 +82,7 @@ class TrainConfig:
     max_len: Optional[int] = None # None → auto from task
 
     # Model
-    model_type: str = 'plucker'  # plucker | bender | transformer
+    model_type: str = 'plucker'  # plucker | bender | energy_bender | transformer
     model_dim: int = 128
     num_layers: int = 4
     num_heads: int = 8 # transformer baseline only
@@ -103,6 +104,14 @@ class TrainConfig:
     lambda_cons: float = 0.0   # backbone–pairing consistency weight (disabled by default)
     lambda_pair: float = 0.1   # pair-map (BPP supervision) weight
     use_pair_head:bool  = True         # include pair-map head
+
+    # Energy Bender model (model_type='energy_bender')
+    energy_loss_type:   str   = 'perceptron'   # 'perceptron' | 'ssvm'
+    energy_hidden:      int   = 64             # energy MLP hidden size
+    energy_lambda_smooth: float = 0.01         # curvature smoothness weight
+    energy_min_hairpin: int   = 4              # minimum hairpin loop length
+    energy_canonical_only: bool = True         # restrict to AU/GC/GU pairs
+    without_grassmann:  bool  = False          # ablation A (sequence-only energies)
 
     # MoE model (model_type='moe')
     gate_type: str  = 'scalar'  # 'scalar' | 'vector'
@@ -548,6 +557,22 @@ def build_model(cfg: TrainConfig):
             pos_emb_type = cfg.pos_emb_type,
         )
 
+    if cfg.model_type == 'energy_bender':
+        return RNABenderEnergyModel(
+            model_dim          = cfg.model_dim,
+            num_layers         = cfg.num_layers,
+            reduced_dim        = cfg.reduced_dim,
+            ff_dim             = cfg.ff_dim,
+            dropout            = cfg.dropout,
+            energy_hidden      = cfg.energy_hidden,
+            loss_type          = cfg.energy_loss_type,
+            lambda_smooth      = cfg.energy_lambda_smooth,
+            min_hairpin        = cfg.energy_min_hairpin,
+            canonical_only     = cfg.energy_canonical_only,
+            without_grassmann  = cfg.without_grassmann,
+            max_len            = cfg.max_len or 4096,
+        )
+
     # Default: original structure-edge Plücker model
     return RNAStructureGrassmann(
         model_dim    = cfg.model_dim,
@@ -666,6 +691,7 @@ def evaluate(
 ) -> Dict[str, float]:
     model.eval()
 
+
     if task == 'rnastralign':
         return _evaluate_structure(model, loader, device)
 
@@ -768,6 +794,14 @@ def _make_folding_loss_fn(cfg: 'TrainConfig'):
     lco  = cfg.lambda_cons
 
     def _loss(outputs, batch):
+        # Energy-based models (e.g. RNABenderEnergyModel) compute their own
+        # structured-hinge / perceptron loss internally and store it in outputs['loss'].
+        # Their pair_logits are ±10 pseudo-logits (discrete), so BCE gives near-zero
+        # gradients — skip folding_loss entirely and use the internal loss instead.
+        # Optional curvature smoothness is already baked into the internal loss.
+        if 'loss' in outputs:
+            return outputs['loss']
+
         return folding_loss(
             outputs,
             pair_targets = batch['pair_targets'],
@@ -1269,13 +1303,15 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid', 'fcgrcnn', 'geofold'],
-                   help='plucker  = original StructureEdgePlucker; '
-                        'bender = RNA Bender with Grassmann curvature; '
-                        'transformer  = standard MHA baseline (sequence-only); '
-                        'moe  = seq + geom mixture-of-experts; '
-                        'hybrid   = two-stage: geometry bottleneck + seq cross-attn'
-                        'fcgrcnn = fcgr based cnn approach')
+                   choices=['plucker', 'bender', 'energy_bender', 'transformer',
+                            'moe', 'hybrid', 'fcgrcnn', 'geofold'],
+                   help='plucker        = original StructureEdgePlucker; '
+                        'bender         = RNA Bender with Grassmann curvature; '
+                        'energy_bender  = energy-based ablation (Grassmann→energy→fold); '
+                        'transformer    = standard MHA baseline (sequence-only); '
+                        'moe            = seq + geom mixture-of-experts; '
+                        'hybrid         = two-stage: geometry bottleneck + seq cross-attn; '
+                        'fcgrcnn        = fcgr based cnn approach')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--num_heads',    type=int,   default=8,
@@ -1305,6 +1341,19 @@ def parse_args() -> TrainConfig:
     p.add_argument('--pos_emb_type', default='learned', choices=['sinusoidal', 'learned'],
                    help='[bender] Positional encoding type: sinusoidal (no params, any length) '
                         'or learned (fixed max_len, adds max_len×dim parameters)')
+    # Energy Bender
+    p.add_argument('--energy_loss_type', default='perceptron', choices=['perceptron', 'ssvm'],
+                   help='[energy_bender] Training loss: perceptron or SSVM with loss-augmented decoding')
+    p.add_argument('--energy_hidden',    type=int,   default=64,
+                   help='[energy_bender] Hidden size for energy MLP heads')
+    p.add_argument('--energy_lambda_smooth', type=float, default=0.01,
+                   help='[energy_bender] Curvature smoothness regularisation weight')
+    p.add_argument('--energy_min_hairpin',   type=int,   default=4,
+                   help='[energy_bender] Minimum hairpin loop length')
+    p.add_argument('--no_canonical_only', action='store_true',
+                   help='[energy_bender] Allow non-canonical pairs (default: canonical only)')
+    p.add_argument('--without_grassmann', action='store_true',
+                   help='[energy_bender] Ablation A: disable Grassmann features in energy heads')
     # RNAstralign / folding
     p.add_argument('--data_format',  default='csv', choices=['csv', 'json', 'bpseq'],
                    help='[rnastralign] Input format: csv, json dict, or bpseq directory')
@@ -1443,7 +1492,13 @@ def parse_args() -> TrainConfig:
         seq_num_layers_hybrid = args.seq_num_layers_hybrid,
         struct_bottleneck_dim = args.struct_bottleneck_dim,
         glob_bottleneck_dim  = args.glob_bottleneck_dim,
-        bottleneck_mode      = args.bottleneck_mode,
+        bottleneck_mode          = args.bottleneck_mode,
+        energy_loss_type         = args.energy_loss_type,
+        energy_hidden            = args.energy_hidden,
+        energy_lambda_smooth     = args.energy_lambda_smooth,
+        energy_min_hairpin       = args.energy_min_hairpin,
+        energy_canonical_only    = not args.no_canonical_only,
+        without_grassmann        = args.without_grassmann,
     )
     if args.label_col:
         cfg.label_col = args.label_col
