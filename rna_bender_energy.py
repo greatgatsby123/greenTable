@@ -725,14 +725,14 @@ class RNABenderEnergyModel(nn.Module):
         if ff_dim is None:
             ff_dim = 4 * model_dim
 
-        self.model_dim         = model_dim
-        self.reduced_dim       = reduced_dim
-        plu_dim                = reduced_dim * (reduced_dim - 1) // 2
-        self.plu_dim           = plu_dim
-        self.loss_type         = loss_type
-        self.lambda_smooth     = lambda_smooth
-        self.min_hairpin       = min_hairpin
-        self.canonical_only    = canonical_only
+        self.model_dim = model_dim
+        self.reduced_dim = reduced_dim
+        plu_dim = reduced_dim * (reduced_dim - 1) // 2
+        self.plu_dim = plu_dim
+        self.loss_type = loss_type
+        self.lambda_smooth = lambda_smooth
+        self.min_hairpin = min_hairpin
+        self.canonical_only = canonical_only
         self.without_grassmann = without_grassmann
 
         # ── Embeddings ────────────────────────────────────────────────────────
@@ -808,14 +808,14 @@ class RNABenderEnergyModel(nn.Module):
 
     def _compute_loss(
         self,
-        e_local:    torch.Tensor,   # (B, L)
-        e_unp:      torch.Tensor,   # (B, L)
-        e_pair:     torch.Tensor,   # (B, L, L)  masked
+        e_local: torch.Tensor,   # (B, L)
+        e_unp: torch.Tensor,   # (B, L)
+        e_pair: torch.Tensor,   # (B, L, L)  masked
         pair_labels:torch.Tensor,   # (B, L) int64
         pred_pairs: torch.Tensor,   # (B, L) int64  — argmin decoder output
-        phys_mask:  torch.Tensor,   # (B, L, L) bool
+        phys_mask: torch.Tensor,   # (B, L, L) bool
         kappa_list: List[torch.Tensor],
-        seq_mask:   torch.Tensor,   # (B, L)
+        seq_mask: torch.Tensor,   # (B, L)
     ) -> torch.Tensor:
         e_true = _energy_of_structure(e_local, e_unp, e_pair, pair_labels, seq_mask)
 
@@ -824,7 +824,7 @@ class RNABenderEnergyModel(nn.Module):
             # L = E_true − E_pred.
             # pred_pairs is the argmin of E, so E_pred ≤ E_true always → L ≥ 0.
             # Goes to zero when the true structure is a global minimum.
-            e_pred   = _energy_of_structure(e_local, e_unp, e_pair, pred_pairs, seq_mask)
+            e_pred = _energy_of_structure(e_local, e_unp, e_pair, pred_pairs, seq_mask)
             loss_main = (e_true - e_pred).clamp(min=0.0).mean()
 
         else:
@@ -835,13 +835,13 @@ class RNABenderEnergyModel(nn.Module):
             aug_pairs = self.decoder.forward_augmented(
                 e_pair, e_unp, phys_mask, pair_labels
             )
-            e_aug  = _energy_of_structure(e_local, e_unp, e_pair, aug_pairs, seq_mask)
-            delta  = _hamming_loss(aug_pairs, pair_labels, seq_mask)
+            e_aug = _energy_of_structure(e_local, e_unp, e_pair, aug_pairs, seq_mask)
+            delta = _hamming_loss(aug_pairs, pair_labels, seq_mask)
             loss_main = torch.clamp(e_true - e_aug + delta, min=0.0).mean()
 
         # ── Curvature smoothness prior ────────────────────────────────────────
         if self.lambda_smooth > 0 and kappa_list:
-            mf      = seq_mask.float()
+            mf = seq_mask.float()
             n_valid = mf.sum().clamp(min=1)
             loss_sm = sum(
                 (kappa.pow(2).sum(-1) * mf).sum() / n_valid
@@ -855,10 +855,10 @@ class RNABenderEnergyModel(nn.Module):
 
     def forward(
         self,
-        input_ids:    torch.Tensor,                   # (B, L)
-        seq_mask:     torch.Tensor,                   # (B, L) bool
+        input_ids: torch.Tensor,                   # (B, L)
+        seq_mask: torch.Tensor,                   # (B, L) bool
         pair_targets: Optional[torch.Tensor] = None,  # (B, L, L) float — from collate_rnastralign
-        pair_labels:  Optional[torch.Tensor] = None,  # (B, L) int64 — direct label override
+        pair_labels: Optional[torch.Tensor] = None,  # (B, L) int64 — direct label override
         **kwargs,                                     # absorb edge_idx / edge_feat / ss_labels
     ) -> Dict[str, torch.Tensor]:
         """
@@ -882,7 +882,7 @@ class RNABenderEnergyModel(nn.Module):
         """
         # Derive pair_labels from pair_targets if not given directly
         if pair_labels is None and pair_targets is not None:
-            partners  = pair_targets.argmax(dim=-1).long()
+            partners = pair_targets.argmax(dim=-1).long()
             is_paired = (pair_targets.max(dim=-1).values > 0.5)
             pair_labels = torch.where(
                 is_paired, partners, torch.full_like(partners, -1)
@@ -892,15 +892,15 @@ class RNABenderEnergyModel(nn.Module):
 
         # Geometric context from sequence only
         canon_mask = _compute_canon_mask(input_ids)
-        phys_mask  = _physical_pair_mask(
+        phys_mask = _physical_pair_mask(
             seq_mask, canon_mask, self.min_hairpin, self.canonical_only
         )
 
         # Energy tables
         e_local = self.local_head(h, z, p_bb1, kappa)                  # (B, L)
-        e_unp   = self.unpaired_head(h, z, p_bb1)                      # (B, L)
-        e_pair  = self.pair_head(h, z, p_bb1, seq_mask, canon_mask)    # (B, L, L)
-        e_pair  = e_pair.masked_fill(~phys_mask, 3e4)  # fp16-safe forbidden sentinel
+        e_unp = self.unpaired_head(h, z, p_bb1)                      # (B, L)
+        e_pair = self.pair_head(h, z, p_bb1, seq_mask, canon_mask)    # (B, L, L)
+        e_pair = e_pair.masked_fill(~phys_mask, 3e4)  # fp16-safe forbidden sentinel
 
         # Decode optimal structure (non-differentiable argmin)
         pred_pairs = self.decoder(e_pair, e_unp, phys_mask)            # (B, L)
@@ -924,13 +924,13 @@ class RNABenderEnergyModel(nn.Module):
         pair_logits[b_idx[is_pair], clamped[is_pair], i_idx[is_pair]] = 10.0
 
         out: Dict[str, object] = {
-            'pair_logits':     pair_logits,
-            'kappa_list':      kappa_list,
-            'local_energy':    e_local,
+            'pair_logits': pair_logits,
+            'kappa_list': kappa_list,
+            'local_energy': e_local,
             'unpaired_energy': e_unp,
-            'pair_energy':     e_pair,
-            'pred_pairs':      pred_pairs,
-            'total_energy':    total_energy,
+            'pair_energy': e_pair,
+            'pred_pairs': pred_pairs,
+            'total_energy': total_energy,
         }
 
         if pair_labels is not None:
