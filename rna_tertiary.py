@@ -980,15 +980,7 @@ def evaluate_tertiary(
         c   = out['coords']
 
         if coords_true is not None:
-            r4  = compute_rmsd(c, coords_true, mask, atom=1)
-            rb  = compute_rmsd(
-                c.view(c.shape[0], c.shape[1], -1),
-                coords_true.view(*coords_true.shape[:2], -1)
-                    .unsqueeze(-1).expand_as(c.view(c.shape[0], c.shape[1], -1))
-                    .view(c.shape[0], c.shape[1], 3, 3),
-                mask, atom=1,
-            )
-            # simpler 3-bead: average RMSD over the 3 atoms
+            r4    = compute_rmsd(c, coords_true, mask, atom=1)
             all_r = [compute_rmsd(c, coords_true, mask, atom=a) for a in range(3)]
             rb    = torch.stack(all_r).mean(0)
             c4p_rmsds.append(r4.cpu())

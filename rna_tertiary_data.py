@@ -83,6 +83,12 @@ def _parse_mmcif_chain(cif_path: Path) -> Optional[Dict]:
         pass
     try:
         return _parse_with_biopython(cif_path)
+    except ImportError:
+        pass
+    except Exception as e:
+        log.warning(f'Biopython parse failed for {cif_path}: {e}')
+    try:
+        return _parse_with_pure_python(cif_path)
     except Exception as e:
         log.warning(f'Failed to parse {cif_path}: {e}')
         return None
