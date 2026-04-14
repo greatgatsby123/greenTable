@@ -69,9 +69,11 @@ from utr_datasets import (
     NUM_LIBRARIES, collate_utr, compute_metrics,
     kfold_indices, stratified_kfold_indices,
 )
+from rna_tertiary import RNATertiaryModel, evaluate_tertiary
+from rna_tertiary_data import RNA3DTertiaryDataset, collate_rna3d
 
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─ Configuration ─
 
 @dataclass
 class TrainConfig:
@@ -87,7 +89,7 @@ class TrainConfig:
     max_len: Optional[int] = None # None → auto from task
 
     # Model
-    model_type: str = 'plucker'  # plucker | bender | energy_bender | transformer
+    model_type: str = 'plucker'  # plucker | bender | energy_bender | transformer | tertiary
     model_dim: int = 128
     num_layers: int = 4
     num_heads: int = 8 # transformer baseline only
@@ -109,6 +111,14 @@ class TrainConfig:
     lambda_cons: float = 0.0   # backbone–pairing consistency weight (disabled by default)
     lambda_pair: float = 0.1   # pair-map (BPP supervision) weight
     use_pair_head:bool  = True         # include pair-map head
+
+    # RNA 3D tertiary model (model_type='tertiary', task='rna3d')
+    tertiary_n_refine: int   = 4       # iterative refinement steps
+    tertiary_w_fape:   float = 1.0    # FAPE loss weight
+    tertiary_w_disto:  float = 0.5    # distogram loss weight
+    tertiary_w_ori:    float = 0.3    # orientation loss weight
+    tertiary_w_bond:   float = 0.1    # bond-length penalty weight
+    tertiary_w_rank:   float = 0.2    # ranking loss weight
 
     # Energy Bender model (model_type='energy_bender')
     energy_loss_type:   str   = 'perceptron'   # 'perceptron' | 'ssvm'
@@ -181,6 +191,11 @@ class TrainConfig:
 
 def _auto_fill(cfg: TrainConfig) -> TrainConfig:
     """Fill task-dependent defaults for fields left as None."""
+    if cfg.task == 'rna3d':
+        if cfg.device == 'auto':
+            cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        return cfg
+
     if cfg.task == 'rnastralign':
         # Folding task: column defaults differ from UTR tasks
         if cfg.seq_col is None: cfg.seq_col = 'sequence'
@@ -212,6 +227,14 @@ def _auto_fill(cfg: TrainConfig) -> TrainConfig:
 
 def build_dataset(cfg: TrainConfig):
     """Instantiate the right dataset class for the given task."""
+    if cfg.task == 'rna3d':
+        cache_dir = os.path.join(cfg.output_dir, 'rna3d_cache')
+        return RNA3DTertiaryDataset(
+            root      = cfg.data,
+            max_len   = cfg.max_len,
+            cache_dir = cache_dir,
+        )
+
     if cfg.task == 'rnastralign':
         return RNAstralignDataset(
             cfg.data,
@@ -562,6 +585,24 @@ def build_model(cfg: TrainConfig):
             pos_emb_type = cfg.pos_emb_type,
         )
 
+    if cfg.model_type == 'tertiary':
+        return RNATertiaryModel(
+            model_dim     = cfg.model_dim,
+            num_layers    = cfg.num_layers,
+            reduced_dim   = cfg.reduced_dim,
+            ff_dim        = cfg.ff_dim or 4 * cfg.model_dim,
+            dropout       = cfg.dropout,
+            n_refine      = cfg.tertiary_n_refine,
+            energy_hidden = cfg.energy_hidden,
+            max_len       = cfg.max_len or 4096,
+            w_fape        = cfg.tertiary_w_fape,
+            w_disto       = cfg.tertiary_w_disto,
+            w_ori         = cfg.tertiary_w_ori,
+            w_bond        = cfg.tertiary_w_bond,
+            w_rank        = cfg.tertiary_w_rank,
+            w_curv        = cfg.energy_lambda_smooth,
+        )
+
     if cfg.model_type == 'energy_bender':
         return RNABenderEnergyModel(
             model_dim          = cfg.model_dim,
@@ -703,6 +744,9 @@ def evaluate(
     model.eval()
 
 
+    if task == 'rna3d':
+        return evaluate_tertiary(model, loader, device)
+
     if task == 'rnastralign':
         return _evaluate_structure(model, loader, device)
 
@@ -792,10 +836,20 @@ def primary_metric(metrics: Dict[str, float], task: str) -> float:
         return metrics['aupr']
     if task == 'rnastralign':
         return metrics.get('pair_f1', 0.0)
+    if task == 'rna3d':
+        # Lower C4' RMSD is better; negate so higher = better for early stopping.
+        return -metrics.get('c4p_rmsd', float('inf'))
     return metrics.get('spearman_r', metrics.get('pearson_r', -metrics['mse']))
 
 
 # ─── Folding loss factory ─────────────────────────────────────────────────────
+
+def _make_tertiary_loss_fn():
+    """Loss for rna3d task: model computes its own loss internally."""
+    def _loss(outputs, _):
+        return outputs['loss']
+    return _loss
+
 
 def _make_folding_loss_fn(cfg: 'TrainConfig'):
     """Return a compute_loss_fn(outputs, batch) callable for the rnastralign task."""
@@ -857,10 +911,10 @@ def _unfreeze_pretrained(model) -> str:
 # ─── Single fold training ─────────────────────────────────────────────────────
 
 def train_fold(
-    cfg:          TrainConfig,
+    cfg: TrainConfig,
     dataset,
-    train_idx:    np.ndarray,
-    val_idx:      np.ndarray,
+    train_idx: np.ndarray,
+    val_idx:  np.ndarray,
     fold_num:     int = 1,
     val_dataset   = None,    # if given, use instead of Subset(dataset, val_idx)
     test_dataset  = None,    # evaluated ONCE after training; never used for selection
@@ -873,21 +927,25 @@ def train_fold(
     the end with the best checkpoint — it is never seen during model selection.
     """
     device = torch.device(cfg.device)
-    if cfg.task == 'rnastralign':
-        task        = 'rnastralign'
-        collate_fn  = collate_rnastralign
-        loss_fn     = _make_folding_loss_fn(cfg)
+    if cfg.task == 'rna3d':
+        task       = 'rna3d'
+        collate_fn = collate_rna3d
+        loss_fn    = _make_tertiary_loss_fn()
+    elif cfg.task == 'rnastralign':
+        task = 'rnastralign'
+        collate_fn = collate_rnastralign
+        loss_fn = _make_folding_loss_fn(cfg)
     elif cfg.task == 'ires':
-        task        = 'classification'
-        collate_fn  = collate_utr
-        loss_fn     = None
+        task = 'classification'
+        collate_fn = collate_utr
+        loss_fn = None
     else:
-        task        = 'regression'
+        task = 'regression'
         collate_fn  = collate_utr
-        loss_fn     = None
+        loss_fn  = None
 
     train_ds = Subset(dataset, train_idx)
-    val_ds   = val_dataset if val_dataset is not None else Subset(dataset, val_idx)
+    val_ds = val_dataset if val_dataset is not None else Subset(dataset, val_idx)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -1151,7 +1209,10 @@ def run_eval(cfg: TrainConfig):
     dataset = build_dataset(cfg)
     print(f'  Eval dataset: {len(dataset)} sequences')
 
-    if cfg.task == 'rnastralign':
+    if cfg.task == 'rna3d':
+        task       = 'rna3d'
+        collate_fn = collate_rna3d
+    elif cfg.task == 'rnastralign':
         task       = 'rnastralign'
         collate_fn = collate_rnastralign
     elif cfg.task == 'ires':
@@ -1208,7 +1269,9 @@ def run_cv(cfg: TrainConfig):
 
     dataset = build_dataset(cfg)
     n = len(dataset)
-    if cfg.task == 'rnastralign':
+    if cfg.task == 'rna3d':
+        task = 'rna3d'
+    elif cfg.task == 'rnastralign':
         task = 'rnastralign'
     elif cfg.task == 'ires':
         task = 'classification'
@@ -1291,7 +1354,7 @@ def parse_args() -> TrainConfig:
     )
     # Data
     p.add_argument('--task',         default='mrl',
-                   choices=['mrl', 'te', 'el', 'ires', 'rlu', 'rnastralign'])
+                   choices=['mrl', 'te', 'el', 'ires', 'rlu', 'rnastralign', 'rna3d'])
     p.add_argument('--data',         required=True,
                    help='Path to input CSV file')
     p.add_argument('--bpp_backend',  default='mfe',
@@ -1315,7 +1378,7 @@ def parse_args() -> TrainConfig:
     # Model
     p.add_argument('--model_type',   default='plucker',
                    choices=['plucker', 'bender', 'energy_bender', 'transformer',
-                            'moe', 'hybrid', 'fcgrcnn', 'geofold'],
+                            'moe', 'hybrid', 'fcgrcnn', 'geofold', 'tertiary'],
                    help='plucker        = original StructureEdgePlucker; '
                         'bender         = RNA Bender with Grassmann curvature; '
                         'energy_bender  = energy-based ablation (Grassmann→energy→fold); '
@@ -1365,6 +1428,19 @@ def parse_args() -> TrainConfig:
                    help='[energy_bender] Allow non-canonical pairs (default: canonical only)')
     p.add_argument('--without_grassmann', action='store_true',
                    help='[energy_bender] Ablation A: disable Grassmann features in energy heads')
+    # RNA 3D tertiary
+    p.add_argument('--tertiary_n_refine', type=int,   default=4,
+                   help='[tertiary] Number of iterative refinement steps')
+    p.add_argument('--tertiary_w_fape',  type=float, default=1.0,
+                   help='[tertiary] FAPE loss weight')
+    p.add_argument('--tertiary_w_disto', type=float, default=0.5,
+                   help='[tertiary] Distogram cross-entropy loss weight')
+    p.add_argument('--tertiary_w_ori',   type=float, default=0.3,
+                   help='[tertiary] Orientation cross-entropy loss weight')
+    p.add_argument('--tertiary_w_bond',  type=float, default=0.1,
+                   help='[tertiary] Bond-length penalty weight')
+    p.add_argument('--tertiary_w_rank',  type=float, default=0.2,
+                   help='[tertiary] Ranking loss weight (E_true < E_decoy)')
     # RNAstralign / folding
     p.add_argument('--data_format',  default='csv', choices=['csv', 'json', 'bpseq'],
                    help='[rnastralign] Input format: csv, json dict, or bpseq directory')
@@ -1510,6 +1586,12 @@ def parse_args() -> TrainConfig:
         energy_min_hairpin       = args.energy_min_hairpin,
         energy_canonical_only    = not args.no_canonical_only,
         without_grassmann        = args.without_grassmann,
+        tertiary_n_refine        = args.tertiary_n_refine,
+        tertiary_w_fape          = args.tertiary_w_fape,
+        tertiary_w_disto         = args.tertiary_w_disto,
+        tertiary_w_ori           = args.tertiary_w_ori,
+        tertiary_w_bond          = args.tertiary_w_bond,
+        tertiary_w_rank          = args.tertiary_w_rank,
     )
     if args.label_col:
         cfg.label_col = args.label_col
