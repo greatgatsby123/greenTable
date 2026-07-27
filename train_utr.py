@@ -1378,14 +1378,13 @@ def parse_args() -> TrainConfig:
     # Model
     p.add_argument('--model_type',   default='plucker',
                    choices=['plucker', 'bender', 'energy_bender', 'transformer',
-                            'moe', 'hybrid', 'fcgrcnn', 'geofold', 'tertiary'],
+                            'moe', 'hybrid', 'geofold', 'tertiary'],
                    help='plucker        = original StructureEdgePlucker; '
                         'bender         = RNA Bender with Grassmann curvature; '
                         'energy_bender  = energy-based ablation (Grassmann→energy→fold); '
                         'transformer    = standard MHA baseline (sequence-only); '
                         'moe            = seq + geom mixture-of-experts; '
-                        'hybrid         = two-stage: geometry bottleneck + seq cross-attn; '
-                        'fcgrcnn        = fcgr based cnn approach')
+                        'hybrid         = two-stage: geometry bottleneck + seq cross-attn; ')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--num_heads',    type=int,   default=8,
