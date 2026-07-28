@@ -447,16 +447,49 @@ def run_variant_fold(
     best_epoch = 0
     best_metrics: Dict[str, float] = {}
     no_improve = 0
+    start_epoch = 1
 
     os.makedirs(out_dir, exist_ok=True)
+    resume_path = os.path.join(out_dir, f'{cfg.task}_fold{fold_num}_resume.pt')
+
+    # ── Resume from a Ctrl-C / crash within this variant, if a checkpoint exists ──
+    if os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['state_dict'])
+        opt.load_state_dict(ckpt['optimizer'])
+        sched.load_state_dict(ckpt['scheduler'])
+        if scaler and ckpt.get('scaler'):
+            scaler.load_state_dict(ckpt['scaler'])
+        start_epoch = ckpt['epoch'] + 1
+        best_score = ckpt['best_score']
+        best_epoch = ckpt['best_epoch']
+        best_metrics = ckpt['best_metrics']
+        best_state = ckpt['best_state']
+        no_improve = ckpt['no_improve']
+        print(f'  [{variant}] Resumed from epoch {ckpt["epoch"]} '
+              f'(best_score={best_score:.4f} @ epoch {best_epoch})')
 
     val_size = len(val_dataset) if val_dataset is not None else len(val_idx)
     amp_tag = 'AMP' if scaler else 'fp32'
     print(f'\n  [{variant}] Fold {fold_num} | {len(train_idx)} train / {val_size} val '
           f'| {n_params:,} params | {amp_tag} | eval_every={cfg.eval_every}')
 
+    def _save_resume(epoch: int):
+        torch.save({
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': opt.state_dict(),
+            'scheduler': sched.state_dict(),
+            'scaler': scaler.state_dict() if scaler else None,
+            'best_score': best_score,
+            'best_epoch': best_epoch,
+            'best_metrics': best_metrics,
+            'best_state': best_state,
+            'no_improve': no_improve,
+        }, resume_path)
+
     t_start = time.time()
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, opt, sched, device,
                                   cfg.clip_grad, scaler, compute_loss_fn=None)
@@ -480,12 +513,15 @@ def run_variant_fold(
             print(f'    [{variant}] E{epoch:03d} loss={train_loss:.4f} | {m_str} '
                   f'[{elapsed:.1f}s] {"*" if no_improve == 0 else ""}')
 
+            _save_resume(epoch)
+
             if no_improve >= cfg.patience:
                 print(f'    [{variant}] Early stop at epoch {epoch} '
                       f'(no improvement for {cfg.patience} evals)')
                 break
         else:
             print(f'    [{variant}] E{epoch:03d} loss={train_loss:.4f} [{elapsed:.1f}s]')
+            _save_resume(epoch)
 
     total_elapsed = time.time() - t_start
     print(f'  [{variant}] Best @ epoch {best_epoch}: '
