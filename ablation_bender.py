@@ -362,7 +362,16 @@ def build_folds(cfg: TrainConfig, dataset, n: int):
     Copied from train_utr.run_cv (rnastralign family-split branch omitted —
     not applicable to mrl/te/el/ires/rlu).
     """
+    # Built unconditionally on cfg.test_data — NOT gated on whether split_file
+    # already exists.  (train_utr.py's run_cv ties this to the split_file
+    # branch, which is fine for a single invocation but silently drops the
+    # test set on any later invocation that resumes from an existing
+    # split_file — exactly what happened here across a Ctrl-C resume.)
     hold_out_ds = None
+    if cfg.test_data is not None:
+        test_cfg = dataclasses.replace(cfg, data=cfg.test_data)
+        hold_out_ds = build_dataset(test_cfg)
+
     if cfg.split_file and os.path.exists(cfg.split_file):
         with open(cfg.split_file) as f:
             saved = json.load(f)
@@ -371,8 +380,6 @@ def build_folds(cfg: TrainConfig, dataset, n: int):
         print(f'Split loaded: {cfg.split_file} ({len(folds)} fold(s), '
               f'{len(folds[0][0])} train / {len(folds[0][1])} val)')
     elif cfg.test_data is not None:
-        test_cfg = dataclasses.replace(cfg, data=cfg.test_data)
-        hold_out_ds = build_dataset(test_cfg)
         idx = np.random.permutation(n)
         split = int(n * (1 - cfg.val_frac))
         folds = [(idx[:split], idx[split:])]

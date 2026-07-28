@@ -438,6 +438,7 @@ def build_model(cfg: TrainConfig):
         aux_struct = True      if is_folding else cfg.aux_struct
         return RNATransformerBaseline(
             model_dim = cfg.model_dim,
+            max_len = cfg.max_len or 256,
             num_layers = cfg.num_layers,
             num_heads = cfg.num_heads,
             ff_dim = cfg.ff_dim,
